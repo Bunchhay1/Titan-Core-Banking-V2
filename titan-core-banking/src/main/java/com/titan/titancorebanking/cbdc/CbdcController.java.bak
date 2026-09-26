@@ -1,0 +1,37 @@
+package com.titan.titancorebanking.cbdc;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+
+@RestController
+@RequestMapping("/api/v1/cbdc")
+@RequiredArgsConstructor
+public class CbdcController {
+
+    private final CbdcBridgeService cbdcBridgeService;
+
+    public record MintRequest(Long accountId, BigDecimal amount, String walletAddress) {}
+
+    @PostMapping("/mint")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<CbdcMintRecord> mint(@RequestBody MintRequest req) {
+        return ResponseEntity.ok(cbdcBridgeService.mintCbdc(req.accountId(), req.amount(), req.walletAddress()));
+    }
+
+    @PostMapping("/burn/{txHash}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<Void> burn(@PathVariable String txHash) {
+        cbdcBridgeService.burnCbdc(txHash);
+        return ResponseEntity.ok().build();
+    }
+
+    @PostMapping("/confirm/{txHash}")
+    public ResponseEntity<Void> confirm(@PathVariable String txHash) {
+        cbdcBridgeService.confirmMint(txHash);
+        return ResponseEntity.ok().build();
+    }
+}

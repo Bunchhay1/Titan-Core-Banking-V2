@@ -1,0 +1,42 @@
+package com.titan.titancorebanking.htlc;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+import java.math.BigDecimal;
+
+@RestController
+@RequestMapping("/api/v1/htlc")
+@RequiredArgsConstructor
+public class HtlcController {
+
+    private final HtlcService htlcService;
+
+    public record LockRequest(Long senderAccountId, Long receiverAccountId,
+                               BigDecimal amount, String hashLock, String memo) {}
+    public record ClaimRequest(String preimage) {}
+
+    @PostMapping("/lock")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<HtlcContract> lock(@RequestBody LockRequest req) {
+        return ResponseEntity.ok(htlcService.lock(
+                req.senderAccountId(), req.receiverAccountId(),
+                req.amount(), req.hashLock(), req.memo()));
+    }
+
+    @PostMapping("/{contractId}/claim")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<HtlcContract> claim(@PathVariable String contractId,
+                                               @RequestBody ClaimRequest req) {
+        return ResponseEntity.ok(htlcService.claim(contractId, req.preimage()));
+    }
+
+    @GetMapping("/{contractId}")
+    public ResponseEntity<HtlcContract> get(@PathVariable String contractId) {
+        return htlcService.htlcRepository.findById(contractId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+}

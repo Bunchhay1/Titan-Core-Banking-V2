@@ -1,0 +1,163 @@
+package com.titan.titancorebanking.failsafe;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.spec.X509EncodedKeySpec;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Base64;
+
+/**
+ * Task 10: Dead Man's Switch & Liquidity Lockdown
+ *
+ * Requires a cryptographically signed heartbeat from the executive team
+ * every 24 hours. If the heartbeat is missed, the switch trips:
+ *
+ *  1. Sets LOCKDOWN flag in Redis (all transaction endpoints check this)
+ *  2. Revokes all admin JWT sessions (Redis blacklist)
+ *  3. Freezes all outbound Kafka publishing (OutboxRelayService checks flag)
+ *  4. Logs immutable audit entry to append-only table
+ *  5. Sends emergency alert
+ *
+ * Heartbeat: POST /api/v1/failsafe/heartbeat with RSA-signed timestamp
+ * Signed by executive's private key; verified against registered public key.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class DeadMansSwitchService {
+
+    private final StringRedisTemplate redisTemplate;
+    private final LockdownAuditRepository lockdownAuditRepository;
+
+    private static final String HEARTBEAT_KEY = "dms:last_heartbeat";
+    private static final String LOCKDOWN_FLAG  = "dms:lockdown_active";
+    private static final String ADMIN_REVOKE_PREFIX = "dms:revoked:";
+    private static final Duration HEARTBEAT_WINDOW = Duration.ofHours(24);
+
+    @Value("${dms.executive.public-key-pem:}")
+    private String executivePublicKeyPem;
+
+    @Value("${dms.enabled:true}")
+    private boolean enabled;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Heartbeat check: runs every 5 minutes
+    // ─────────────────────────────────────────────────────────────────────────
+    @Scheduled(fixedDelay = 300_000)
+    public void checkHeartbeat() {
+        if (!enabled) return;
+
+        String lastHeartbeatStr = redisTemplate.opsForValue().get(HEARTBEAT_KEY);
+        if (lastHeartbeatStr == null) {
+            log.warn("DMS: No heartbeat recorded yet. Waiting for first heartbeat.");
+            return;
+        }
+
+        Instant lastHeartbeat = Instant.ofEpochMilli(Long.parseLong(lastHeartbeatStr));
+        Duration elapsed = Duration.between(lastHeartbeat, Instant.now());
+
+        if (elapsed.compareTo(HEARTBEAT_WINDOW) > 0) {
+            log.error("💀 DEAD MAN'S SWITCH TRIPPED — No heartbeat for {}h {}m",
+                    elapsed.toHours(), elapsed.toMinutesPart());
+            tripSwitch("Heartbeat timeout: " + elapsed.toHours() + " hours without executive sign-in");
+        } else {
+            log.debug("DMS: Heartbeat OK. Last: {} ({} hours ago)", lastHeartbeat, elapsed.toHours());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Receive signed heartbeat from executive
+    // ─────────────────────────────────────────────────────────────────────────
+    public void receiveHeartbeat(String timestampEpochMs, String base64Signature) throws Exception {
+        // Verify RSA signature: sign(timestamp) with executive private key
+        if (!verifySignature(timestampEpochMs, base64Signature)) {
+            throw new SecurityException("Invalid heartbeat signature — rejected");
+        }
+
+        long timestamp = Long.parseLong(timestampEpochMs);
+        Instant signedAt = Instant.ofEpochMilli(timestamp);
+
+        // Reject replayed heartbeats (must be within last 5 minutes)
+        if (Duration.between(signedAt, Instant.now()).abs().compareTo(Duration.ofMinutes(5)) > 0) {
+            throw new SecurityException("Heartbeat timestamp too old — replay attack rejected");
+        }
+
+        redisTemplate.opsForValue().set(HEARTBEAT_KEY, timestampEpochMs);
+        log.info("✅ DMS: Heartbeat received and verified at {}", signedAt);
+
+        // If lockdown was active and executive manually resets, clear it
+        // (requires separate admin endpoint with MFA — not auto-cleared here)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TRIP: Activate lockdown
+    // ─────────────────────────────────────────────────────────────────────────
+    public void tripSwitch(String reason) {
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(LOCKDOWN_FLAG))) {
+            log.warn("DMS: Lockdown already active");
+            return;
+        }
+
+        log.error("🔒 LOCKDOWN ACTIVATED: {}", reason);
+
+        // 1. Set lockdown flag (permanent until manually cleared by quorum)
+        redisTemplate.opsForValue().set(LOCKDOWN_FLAG, Instant.now().toString());
+
+        // 2. Revoke all admin sessions
+        redisTemplate.opsForValue().set(ADMIN_REVOKE_PREFIX + "all", Instant.now().toString());
+
+        // 3. Record immutable audit entry
+        lockdownAuditRepository.save(LockdownAuditEntry.builder()
+                .reason(reason)
+                .triggeredAt(java.time.LocalDateTime.now())
+                .build());
+
+        // 4. Alert (in production: PagerDuty, SMS, email)
+        log.error("🚨 EMERGENCY ALERT: Titan Core Banking LOCKDOWN. Reason: {}", reason);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Manual trip (hostile takeover / ransomware detection)
+    // ─────────────────────────────────────────────────────────────────────────
+    public void manualTrip(String reason, String adminSignature) throws Exception {
+        if (!verifySignature(reason, adminSignature)) {
+            throw new SecurityException("Unauthorized manual trip attempt");
+        }
+        tripSwitch("MANUAL: " + reason);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Check if system is in lockdown (called by TransactionService, OutboxRelay)
+    // ─────────────────────────────────────────────────────────────────────────
+    public boolean isLockdownActive() {
+        return Boolean.TRUE.equals(redisTemplate.hasKey(LOCKDOWN_FLAG));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // RSA signature verification
+    // ─────────────────────────────────────────────────────────────────────────
+    private boolean verifySignature(String message, String base64Signature) throws Exception {
+        if (executivePublicKeyPem == null || executivePublicKeyPem.isBlank()) {
+            log.warn("DMS: No executive public key configured — heartbeat verification skipped");
+            return true; // dev mode
+        }
+
+        byte[] pubKeyBytes = Base64.getDecoder().decode(
+                executivePublicKeyPem.replaceAll("-----.*-----", "").replaceAll("\\s", ""));
+        PublicKey pubKey = KeyFactory.getInstance("RSA")
+                .generatePublic(new X509EncodedKeySpec(pubKeyBytes));
+
+        Signature sig = Signature.getInstance("SHA256withRSA");
+        sig.initVerify(pubKey);
+        sig.update(message.getBytes(StandardCharsets.UTF_8));
+        return sig.verify(Base64.getDecoder().decode(base64Signature));
+    }
+}

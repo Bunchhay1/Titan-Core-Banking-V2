@@ -1,0 +1,26 @@
+package com.titan.titancorebanking.graphql;
+
+import com.titan.titancorebanking.graphql.CoreBankingGraphQLController.TransactionEventDTO;
+import org.springframework.stereotype.Component;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Sinks;
+
+/**
+ * Hot Flux publisher for GraphQL Subscriptions.
+ * TransactionService calls publish() after a successful transfer.
+ * All active WebSocket subscribers receive the event instantly.
+ */
+@Component
+public class TransactionEventPublisher {
+
+    private final Sinks.Many<TransactionEventDTO> sink =
+            Sinks.many().multicast().onBackpressureBuffer();
+
+    public void publish(TransactionEventDTO event) {
+        sink.tryEmitNext(event);
+    }
+
+    public Flux<TransactionEventDTO> getStream() {
+        return sink.asFlux();
+    }
+}

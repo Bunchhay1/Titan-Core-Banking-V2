@@ -1,0 +1,10 @@
+package com.titan.titancorebanking.cbdc;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import java.util.List;
+import java.util.Optional;
+
+public interface CbdcMintRepository extends JpaRepository<CbdcMintRecord, Long> {
+    Optional<CbdcMintRecord> findByBlockchainTxHash(String txHash);
+    List<CbdcMintRecord> findByAccountIdAndStatus(Long accountId, CbdcMintRecord.MintStatus status);
+}

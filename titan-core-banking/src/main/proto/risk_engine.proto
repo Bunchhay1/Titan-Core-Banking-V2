@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+// ឈ្មោះ Package សម្រាប់កូដ AI (Python)
+package risk_engine;
+
+// ✅ ឈ្មោះ Package សម្រាប់កូដ Java (ត្រូវតែដូចគ្នាជាមួយអ្វីដែលលោក Import)
+option java_package = "com.titan.riskengine";
+option java_outer_classname = "RiskEngineProto";
+option java_multiple_files = true;
+
+service RiskEngineService {
+  rpc CheckRisk (RiskCheckRequest) returns (RiskCheckResponse);
+}
+
+message RiskCheckRequest {
+  string user_id = 1;
+  double amount = 2;
+}
+
+message RiskCheckResponse {
+  int32 risk_score = 1;
+  string risk_level = 2; // "LOW", "MEDIUM", "HIGH"
+  string action = 3;     // "ALLOW", "DENY", "MANUAL_REVIEW"
+}
