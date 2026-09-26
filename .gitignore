@@ -10,6 +10,7 @@
 target/
 build/
 *.class
+.jqwik-database
 
 # Environment & Secrets
 .env
