@@ -17,12 +17,6 @@
     <name>titan-core-banking</name>
 
     <dependencies>
-        <dependency>
-            <groupId>com.titan</groupId>
-            <artifactId>titan-event-consumer-lib</artifactId>
-            <version>0.0.1-SNAPSHOT</version>
-        </dependency>
-
         <!-- Core & Web -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

@@ -19,10 +19,7 @@
     <description>Titan Banking Microservices</description>
 
     <modules>
-        <module>titan-event-consumer-lib</module>
         <module>titan-core-banking</module>
-        <module>titan-notifications-service</module>
-        <module>titan-promotions-service</module>
     </modules>
 
     <properties>
