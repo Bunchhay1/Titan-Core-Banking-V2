@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package titan.escrow;
+
+option java_package = "com.titan.promotions.escrow";
+option java_outer_classname = "EscrowProto";
+
+service EscrowService {
+  rpc LockFunds(LockFundsRequest) returns (LockFundsResponse);
+  rpc ReleaseFunds(ReleaseFundsRequest) returns (ReleaseFundsResponse);
+  rpc CheckBalance(CheckBalanceRequest) returns (CheckBalanceResponse);
+}
+
+message LockFundsRequest {
+  int64 campaign_id = 1;
+  string amount = 2;
+  string currency = 3;
+}
+
+message LockFundsResponse {
+  bool success = 1;
+  string escrow_id = 2;
+  string message = 3;
+}
+
+message ReleaseFundsRequest {
+  string escrow_id = 1;
+  int64 account_id = 2;
+  string amount = 3;
+}
+
+message ReleaseFundsResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CheckBalanceRequest {
+  int64 campaign_id = 1;
+}
+
+message CheckBalanceResponse {
+  string locked_amount = 1;
+  string available_amount = 2;
+}

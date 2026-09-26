@@ -67,10 +67,41 @@ public class GlobalExceptionHandler {
         return new ResponseEntity<>(errorResponse, HttpStatus.SERVICE_UNAVAILABLE);
     }
 
-    // 🎯 4. ចាប់យក RuntimeException (Error ទូទៅ - Business Logic)
+    // 🎯 4. Security & Access Denied (IDOR / Unauthorized Access -> 403 Forbidden)
+    @ExceptionHandler({
+            org.springframework.security.access.AccessDeniedException.class,
+            SecurityException.class
+    })
+    public ResponseEntity<ErrorResponse> handleAccessDenied(Exception ex, WebRequest request) {
+        ErrorResponse errorResponse = ErrorResponse.builder()
+                .timestamp(LocalDateTime.now())
+                .status(HttpStatus.FORBIDDEN.value()) // 403 Forbidden
+                .error("Access Denied")
+                .message("You do not have permission to access this resource.")
+                .path(request.getDescription(false).replace("uri=", ""))
+                .build();
+        return new ResponseEntity<>(errorResponse, HttpStatus.FORBIDDEN);
+    }
+
+    // 🎯 5. Database Connection / Pool Exhaustion
+    @ExceptionHandler({
+            org.springframework.transaction.CannotCreateTransactionException.class,
+            org.springframework.dao.DataAccessResourceFailureException.class
+    })
+    public ResponseEntity<ErrorResponse> handleDatabasePoolExhaustion(Exception ex, WebRequest request) {
+        ErrorResponse errorResponse = ErrorResponse.builder()
+                .timestamp(LocalDateTime.now())
+                .status(HttpStatus.SERVICE_UNAVAILABLE.value()) // 503
+                .error("Service Temporarily Busy")
+                .message("Database connection pool is temporarily saturated under high load. Please retry.")
+                .path(request.getDescription(false).replace("uri=", ""))
+                .build();
+        return new ResponseEntity<>(errorResponse, HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    // 🎯 6. Business Logic RuntimeException
     @ExceptionHandler(RuntimeException.class)
     public ResponseEntity<ErrorResponse> handleRuntimeException(RuntimeException ex, WebRequest request) {
-
         ErrorResponse errorResponse = ErrorResponse.builder()
                 .timestamp(LocalDateTime.now())
                 .status(HttpStatus.BAD_REQUEST.value())
@@ -82,10 +113,9 @@ public class GlobalExceptionHandler {
         return new ResponseEntity<>(errorResponse, HttpStatus.BAD_REQUEST);
     }
 
-    // 🎯 4. ចាប់យក Exception (Unexpected Error - 500)
+    // 🎯 7. Unexpected Server Error (500)
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleGlobalException(Exception ex, WebRequest request) {
-
         ErrorResponse errorResponse = ErrorResponse.builder()
                 .timestamp(LocalDateTime.now())
                 .status(HttpStatus.INTERNAL_SERVER_ERROR.value())

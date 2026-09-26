@@ -36,7 +36,6 @@ public class TransactionController {
     // ==================================================================================
     @PostMapping("/transfer")
     @Operation(summary = "Execute Fund Transfer", description = "Transfers money between accounts safely.")
-    @io.github.resilience4j.bulkhead.annotation.Bulkhead(name = "critical", fallbackMethod = "transferFallback")
     public ResponseEntity<TransactionResponse> transfer(
             @RequestBody TransactionRequest request,
             @AuthenticationPrincipal UserDetails userDetails
@@ -44,11 +43,6 @@ public class TransactionController {
         log.info("💸 Transfer Request: {} -> {}", request.fromAccountNumber(), request.toAccountNumber());
         Transaction tx = transactionService.transfer(request, userDetails.getUsername());
         return ResponseEntity.ok(toTransactionResponse(tx));
-    }
-
-    public ResponseEntity<TransactionResponse> transferFallback(TransactionRequest request, UserDetails userDetails, io.github.resilience4j.bulkhead.BulkheadFullException e) {
-        log.error("⚠️ Transfer rejected - system at capacity (Bulkhead Full)", e);
-        return ResponseEntity.status(503).build();
     }
 
     // ==================================================================================

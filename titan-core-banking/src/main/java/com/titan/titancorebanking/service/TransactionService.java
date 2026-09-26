@@ -12,6 +12,7 @@ import com.titan.titancorebanking.repository.TransactionRepository;
 import com.titan.titancorebanking.service.imple.ExchangeRateService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import io.github.resilience4j.retry.annotation.Retry;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -41,19 +42,33 @@ public class TransactionService {
     private final IdempotencyService idempotencyService;
     private final RiskEngineGrpcService riskEngineGrpcService;
     private final DeadMansSwitchService deadMansSwitchService;
+    private final AccountBucketService accountBucketService;
     // NOTE: No NotificationService here. Core-banking publishes events to Kafka
     // via EventPublisherService → OutboxRelayService. titan-notifications-service
     // consumes those Kafka events and owns all push/alert delivery.
 
     // ==================================================================================
-    // 💸 1. TRANSFER (SECURE ENTERPRISE LOGIC)
+    // 💸 1. TRANSFER (SECURE ENTERPRISE LOGIC WITH DETERMINISTIC LOCK ORDERING & FAULT TOLERANCE)
     // ==================================================================================
     @Transactional
+    @Retry(name = "db")
     public Transaction transfer(TransactionRequest request, String currentUsername) {
         // Task 10: Lockdown guard
         if (deadMansSwitchService.isLockdownActive()) {
             throw new IllegalStateException("System is in LOCKDOWN. All transactions are frozen.");
         }
+
+        // Fault Tolerance: Input Validation
+        if (request.fromAccountNumber() == null || request.toAccountNumber() == null) {
+            throw new IllegalArgumentException("Source and destination account numbers are required.");
+        }
+        if (request.fromAccountNumber().trim().equalsIgnoreCase(request.toAccountNumber().trim())) {
+            throw new IllegalArgumentException("Cannot transfer funds to the same account.");
+        }
+        if (request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Transfer amount must be greater than zero.");
+        }
+
         // ✅ FIX 3: Idempotency Check with URI
         if (request.idempotencyKey() != null) {
             var existing = idempotencyService.getTransaction(
@@ -70,22 +85,46 @@ public class TransactionService {
     }
 
     protected Transaction executeSecureTransfer(TransactionRequest request, String currentUsername) {
-        // ✅ JAVA 21: Use var for obvious types
-        Account fromAccount;
-        Account toAccount;
+        // 1. Initial lookups to resolve Primary Key IDs
+        Account rawFrom = accountRepository.findByAccountNumber(request.fromAccountNumber())
+                .orElseThrow(() -> new RuntimeException("Source account not found: " + request.fromAccountNumber()));
+        Account rawTo = accountRepository.findByAccountNumber(request.toAccountNumber())
+                .orElseThrow(() -> new RuntimeException("Destination account not found: " + request.toAccountNumber()));
 
-        // 🔥 DEADLOCK PREVENTION: Lock Ordering Strategy
-        boolean lockFromFirst = request.fromAccountNumber().compareTo(request.toAccountNumber()) < 0;
-
-        if (lockFromFirst) {
-            fromAccount = fetchWithLock(request.fromAccountNumber());
-            toAccount = fetchWithLock(request.toAccountNumber());
-        } else {
-            toAccount = fetchWithLock(request.toAccountNumber());
-            fromAccount = fetchWithLock(request.fromAccountNumber());
+        if (rawFrom.getId().equals(rawTo.getId())) {
+            throw new IllegalArgumentException("Source and destination accounts cannot have the same ID.");
         }
 
-        // Validate ownership and PIN
+        // --- RISK ENGINE CHECK (Pre-flight before acquiring DB locks) ---
+        var riskResponse = riskEngineGrpcService.analyzeTransaction(
+                rawFrom.getUser().getId().toString(),
+                request.amount().doubleValue()
+        );
+
+        if ("BLOCK".equalsIgnoreCase(riskResponse.getAction())) {
+            log.warn("🚫 Transaction BLOCKED by AI Risk Engine: Score={}", riskResponse.getRiskScore());
+            Transaction blockedTx = auditService.saveAuditLog(rawFrom, rawTo, request.amount(),
+                    TransactionType.TRANSFER, TransactionStatus.BLOCKED,
+                    "Blocked by Risk Engine: " + riskResponse.getRiskLevel());
+            return blockedTx;
+        }
+
+        // 2. 🔥 DETERMINISTIC LOCK ORDERING (ID smaller first)
+        Long firstLockId = Math.min(rawFrom.getId(), rawTo.getId());
+        Long secondLockId = Math.max(rawFrom.getId(), rawTo.getId());
+
+        log.debug("🔒 Deterministic locking order: acquiring lock for ID {} then ID {}", firstLockId, secondLockId);
+
+        Account firstLocked = accountRepository.findByIdWithLock(firstLockId)
+                .orElseThrow(() -> new RuntimeException("Account not found for locking: ID " + firstLockId));
+        Account secondLocked = accountRepository.findByIdWithLock(secondLockId)
+                .orElseThrow(() -> new RuntimeException("Account not found for locking: ID " + secondLockId));
+
+        // Map locked accounts back to sender (fromAccount) and receiver (toAccount)
+        Account fromAccount = firstLocked.getId().equals(rawFrom.getId()) ? firstLocked : secondLocked;
+        Account toAccount = firstLocked.getId().equals(rawTo.getId()) ? firstLocked : secondLocked;
+
+        // 3. Validate ownership and PIN on locked row (Prevents TOCTOU race conditions)
         if (!fromAccount.getUser().getUsername().equals(currentUsername)) {
             throw new RuntimeException("⛔ You do not own this account!");
         }
@@ -95,19 +134,6 @@ public class TransactionService {
         }
 
         try {
-            // --- RISK ENGINE CHECK (Task 5) ---
-            var riskResponse = riskEngineGrpcService.analyzeTransaction(
-                fromAccount.getUser().getId().toString(), 
-                request.amount().doubleValue()
-            );
-            
-            if ("BLOCK".equalsIgnoreCase(riskResponse.getAction())) {
-                log.warn("🚫 Transaction BLOCKED by AI Risk Engine: Score={}", riskResponse.getRiskScore());
-                Transaction blockedTx = auditService.saveAuditLog(fromAccount, toAccount, request.amount(),
-                    TransactionType.TRANSFER, TransactionStatus.BLOCKED, 
-                    "Blocked by Risk Engine: " + riskResponse.getRiskLevel());
-                return blockedTx;
-            }
             
             // --- VALIDATION INSIDE LOCK ---
             BigDecimal fee = calculateFee(fromAccount);
@@ -125,12 +151,17 @@ public class TransactionService {
                 note += " [FX: " + fromAccount.getCurrency() + " -> " + toAccount.getCurrency() + "]";
             }
 
-            // --- EXECUTION ---
+            // --- EXECUTION (Debit Sender, Credit Receiver Partitioned Bucket) ---
             fromAccount.setBalance(fromAccount.getBalance().subtract(totalDeduction));
-            toAccount.setBalance(toAccount.getBalance().add(targetAmount));
-
             accountRepository.save(fromAccount);
-            accountRepository.save(toAccount);
+
+            int bucketIndex = accountBucketService.selectRandomBucketIndex();
+            try {
+                accountBucketService.creditBucket(toAccount.getId(), bucketIndex, targetAmount);
+            } catch (Exception e) {
+                toAccount.setBalance(toAccount.getBalance().add(targetAmount));
+                accountRepository.save(toAccount);
+            }
 
             // ✅ FIX 1: Save transaction with idempotency key
             Transaction tx = auditService.saveAuditLog(fromAccount, toAccount, request.amount(),

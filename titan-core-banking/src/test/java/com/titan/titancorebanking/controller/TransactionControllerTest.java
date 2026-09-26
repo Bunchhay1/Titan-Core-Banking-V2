@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.titan.titancorebanking.dto.request.TransactionRequest;
 import com.titan.titancorebanking.model.Transaction;
 import com.titan.titancorebanking.enums.TransactionStatus;
+import com.titan.titancorebanking.enums.TransactionType;
 import com.titan.titancorebanking.service.AccountService;
 import com.titan.titancorebanking.service.TransactionService;
 import org.junit.jupiter.api.Test;
@@ -49,14 +50,14 @@ class TransactionControllerTest {
     @WithMockUser(username = "sender_user")
     void transfer_ShouldReturn200_WhenSuccess() throws Exception {
         TransactionRequest request = new TransactionRequest(
-                "111", "222", new BigDecimal("500.00"), "123456",
+                "001202611111", "001202622222", new BigDecimal("500.00"), "123456",
                 null, null, null, null, null, null);
 
         Transaction mockTx = new Transaction();
+        mockTx.setTransactionType(TransactionType.TRANSFER);
         mockTx.setStatus(TransactionStatus.SUCCESS);
         mockTx.setAmount(new BigDecimal("500.00"));
 
-        // ✅ ប្រើ transactionService ជំនួស accountService ឱ្យត្រូវតាម Controller Logic
         when(transactionService.transfer(any(TransactionRequest.class), eq("sender_user")))
                 .thenReturn(mockTx);
 
@@ -75,7 +76,7 @@ class TransactionControllerTest {
     @WithMockUser(username = "poor_user")
     void transfer_ShouldReturn400_WhenInsufficientFunds() throws Exception {
         TransactionRequest request = new TransactionRequest(
-                "111", null, new BigDecimal("50000.00"), null,
+                "001202611111", "001202622222", new BigDecimal("50000.00"), "123456",
                 null, null, null, null, null, null);
 
         when(transactionService.transfer(any(TransactionRequest.class), eq("poor_user")))
@@ -95,14 +96,23 @@ class TransactionControllerTest {
     @WithMockUser(username = "staff_user")
     void deposit_ShouldReturn200() throws Exception {
         TransactionRequest request = new TransactionRequest(
-                null, "222", new BigDecimal("1000.00"), null,
+                null, "001202622222", new BigDecimal("1000.00"), null,
                 null, null, null, null, null, null);
+
+        Transaction mockTx = new Transaction();
+        mockTx.setTransactionType(TransactionType.DEPOSIT);
+        mockTx.setStatus(TransactionStatus.SUCCESS);
+        mockTx.setAmount(new BigDecimal("1000.00"));
+
+        when(transactionService.deposit(any(TransactionRequest.class)))
+                .thenReturn(mockTx);
 
         mockMvc.perform(post("/api/v1/transactions/deposit")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.message").value("💰 Deposit Successful!"));
+                .andExpect(jsonPath("$.status").value("SUCCESS"))
+                .andExpect(jsonPath("$.amount").value(1000.00));
     }
 
     // ==========================================
@@ -112,14 +122,23 @@ class TransactionControllerTest {
     @WithMockUser(username = "rich_user")
     void withdraw_ShouldReturn200() throws Exception {
         TransactionRequest request = new TransactionRequest(
-                "111", null, new BigDecimal("200.00"), "123456",
+                "001202611111", null, new BigDecimal("200.00"), "123456",
                 null, null, null, null, null, null);
+
+        Transaction mockTx = new Transaction();
+        mockTx.setTransactionType(TransactionType.WITHDRAWAL);
+        mockTx.setStatus(TransactionStatus.SUCCESS);
+        mockTx.setAmount(new BigDecimal("200.00"));
+
+        when(transactionService.withdraw(any(TransactionRequest.class), eq("rich_user")))
+                .thenReturn(mockTx);
 
         mockMvc.perform(post("/api/v1/transactions/withdraw")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.message").value("💸 Withdrawal Successful!"));
+                .andExpect(jsonPath("$.status").value("SUCCESS"))
+                .andExpect(jsonPath("$.amount").value(200.00));
     }
 
 }

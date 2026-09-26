@@ -1,0 +1,41 @@
+# ─── titan-gateway-go configuration ───────────────────────────────────────────
+#
+# All upstream URLs use Docker service names (resolved inside the compose network).
+# When running locally outside Docker, replace service names with localhost:PORT.
+#
+# Port reference:
+#   titan-core-banking          → 8080
+#   titan-notifications-service → 8084
+#   titan-promotions-service    → 8083
+#   titan-loans-service         → 8085
+#   titan-edge-ai               → 8001
+#   titan-federated-learning    → 8098
+#   titan-qkd-service           → 8100
+#   titan-gateway-go (self)     → 8088
+# ──────────────────────────────────────────────────────────────────────────────
+
+server:
+  port: "8088"
+
+upstreams:
+  core_banking:       "http://titan-core-banking:8080"
+  notification:       "http://titan-notifications-service:8084"
+  promotion:          "http://titan-promotions-service:8083"
+  loans:              "http://titan-loans-service:8085"
+  ai_service:         "http://titan-edge-ai:8001"
+  federated_learning: "http://titan-federated-learning:8098"
+  qkd_service:        "http://titan-qkd-service:8100"
+
+auth:
+  # HS256 secret — must match titan-core-banking JWT_SECRET.
+  # Set the JWT_SECRET environment variable; do NOT commit a real secret here.
+  # The default below is the development placeholder only — override it in prod.
+  jwt_secret: "${JWT_SECRET}"
+
+rate_limit:
+  # Maximum requests per IP within the window before the IP is blocked
+  max_requests: 100
+  # Sliding window size in seconds  (100 req / 60s = ~1.67 req/s sustained)
+  window_seconds: 60
+  # How long a violating IP stays blocked (minutes)
+  block_minutes: 5

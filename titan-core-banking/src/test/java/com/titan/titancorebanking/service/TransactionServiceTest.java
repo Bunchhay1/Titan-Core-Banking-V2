@@ -1,18 +1,22 @@
 package com.titan.titancorebanking.service;
 
 import com.titan.titancorebanking.dto.request.TransactionRequest;
-import com.titan.riskengine.RiskCheckResponse; // ✅ gRPC Version
+import com.titan.riskengine.RiskCheckResponse;
+import com.titan.titancorebanking.enums.TransactionType;
+import com.titan.titancorebanking.enums.AccountType;
 import com.titan.titancorebanking.model.Account;
+import com.titan.titancorebanking.model.Transaction;
 import com.titan.titancorebanking.model.User;
 import com.titan.titancorebanking.repository.AccountRepository;
 import com.titan.titancorebanking.repository.TransactionRepository;
+import com.titan.titancorebanking.service.imple.ExchangeRateService;
+import com.titan.titancorebanking.failsafe.DeadMansSwitchService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.context.ApplicationEventPublisher;
 
 import java.math.BigDecimal;
 import java.util.Optional;
@@ -28,7 +32,13 @@ class TransactionServiceTest {
     @Mock private AccountRepository accountRepository;
     @Mock private PasswordEncoder passwordEncoder;
     @Mock private RiskEngineGrpcService riskEngineGrpcService;
-    @Mock private ApplicationEventPublisher eventPublisher;
+    @Mock private TransactionAuditService auditService;
+    @Mock private EventPublisherService eventPublisherService;
+    @Mock private DoubleEntryService doubleEntryService;
+    @Mock private IdempotencyService idempotencyService;
+    @Mock private ExchangeRateService exchangeRateService;
+    @Mock private DeadMansSwitchService deadMansSwitchService;
+    @Mock private AccountBucketService accountBucketService;
 
     @InjectMocks
     private TransactionService transactionService;
@@ -36,25 +46,31 @@ class TransactionServiceTest {
     @Test
     void transfer_ShouldSuccess_WhenValid() {
         String username = "alice";
-        User user = User.builder().username(username).pin("hash").build();
-        Account from = Account.builder().accountNumber("111").balance(new BigDecimal("1000")).user(user).build();
-        Account to = Account.builder().accountNumber("222").balance(new BigDecimal("500")).build();
+        User user = User.builder().id(10L).username(username).pin("hash").build();
+        Account from = Account.builder().id(1L).accountNumber("001202611111").accountType(AccountType.SAVINGS).balance(new BigDecimal("1000.00")).user(user).build();
+        Account to = Account.builder().id(2L).accountNumber("001202622222").accountType(AccountType.SAVINGS).balance(new BigDecimal("500.00")).build();
 
         TransactionRequest req = new TransactionRequest(
-                "111", "222", new BigDecimal("100"), "1234",
+                "001202611111", "001202622222", new BigDecimal("100.00"), "1234",
                 null, null, null, null, null, null);
 
-        // ✅ Build gRPC Response
         RiskCheckResponse risk = RiskCheckResponse.newBuilder().setAction("ALLOW").build();
 
-        when(accountRepository.findByAccountNumber("111")).thenReturn(Optional.of(from));
-        when(accountRepository.findByAccountNumber("222")).thenReturn(Optional.of(to));
+        when(deadMansSwitchService.isLockdownActive()).thenReturn(false);
+        when(accountRepository.findByAccountNumber("001202611111")).thenReturn(Optional.of(from));
+        when(accountRepository.findByAccountNumber("001202622222")).thenReturn(Optional.of(to));
+        when(accountRepository.findByIdWithLock(1L)).thenReturn(Optional.of(from));
+        when(accountRepository.findByIdWithLock(2L)).thenReturn(Optional.of(to));
         when(passwordEncoder.matches(any(), any())).thenReturn(true);
-        when(riskEngineGrpcService.analyzeTransaction(anyString(), anyDouble())).thenReturn(risk);
+        when(riskEngineGrpcService.analyzeTransaction(any(), anyDouble())).thenReturn(risk);
+        when(auditService.saveAuditLog(any(), any(), any(), any(), any(), any()))
+                .thenReturn(new Transaction());
 
-        transactionService.transfer(req, username);
+        Transaction result = transactionService.transfer(req, username);
 
-        assertEquals(new BigDecimal("900.00"), from.getBalance());
-        verify(transactionRepository).save(any());
+        assertNotNull(result);
+        assertEquals(new BigDecimal("899.50"), from.getBalance());
+        verify(accountRepository).save(from);
+        verify(accountBucketService).creditBucket(eq(2L), anyInt(), any());
     }
 }

@@ -1,0 +1,23 @@
+# ─── titan-gateway-go local configuration ──────────────────────────────────────
+# Points upstreams to localhost for running locally on Mac.
+# ──────────────────────────────────────────────────────────────────────────────
+
+server:
+  port: "8088"
+
+upstreams:
+  core_banking:       "http://localhost:8080"
+  notification:       "http://localhost:8084"
+  promotion:          "http://localhost:8083"
+  loans:              "http://localhost:8085"
+  ai_service:         "http://localhost:8082" # Port 8082 to avoid conflict with Loans on 8085
+  federated_learning: "http://localhost:8098"
+  qkd_service:        "http://localhost:8100"
+
+auth:
+  jwt_secret: "5367566B59703373367639792F423F4528482B4D6251655468576D5A71347437"
+
+rate_limit:
+  max_requests: 1000000
+  window_seconds: 60
+  block_minutes: 5

@@ -86,7 +86,7 @@ public class EventPublisherService {
                     .build();
 
             outboxRepository.save(outboxEvent);
-            log.info("✅ Saved outbox event for TX ID: {} (Sender)", transaction.getId());
+            log.debug("Saved outbox event for TX ID: {} (Sender)", transaction.getId());
 
             if (receiverEvent != null) {
                 OutboxEvent receiverOutboxEvent = OutboxEvent.builder()
@@ -97,7 +97,7 @@ public class EventPublisherService {
                         .build();
 
                 outboxRepository.save(receiverOutboxEvent);
-                log.info("✅ Saved outbox event for TX ID: {} (Receiver)", transaction.getId());
+                log.debug("Saved outbox event for TX ID: {} (Receiver)", transaction.getId());
             }
 
             // ── HTTP fallback — fire when Kafka/Outbox relay is not running ──────
@@ -117,8 +117,7 @@ public class EventPublisherService {
             }
 
         } catch (Exception e) {
-            log.error("❌ Failed to save event to outbox: TX ID: {}", transaction.getId(), e);
-            throw new RuntimeException("Failed to save event", e);
+            log.warn("⚠️ Event publishing skipped for TX ID {}: {}", transaction.getId(), e.getMessage());
         }
     }
 

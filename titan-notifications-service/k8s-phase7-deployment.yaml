@@ -1,0 +1,137 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notifications-phase7-config
+  namespace: titan-banking
+data:
+  SPRING_KAFKA_BOOTSTRAPSERVERS: "kafka-us-east:9093"
+  SPRING_KAFKA_BOOTSTRAPSERVERS_REGION2: "kafka-eu-west:9093"
+  KAFKA_RACK_ID: "us-east-1a"
+  VAULT_ENABLED: "true"
+  VAULT_URI: "http://vault:8200"
+  REDIS_HOST: "redis"
+  POSTGRES_HOST: "postgres"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: titan-notifications-phase7
+  namespace: titan-banking
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: titan-notifications
+      phase: "7"
+  template:
+    metadata:
+      labels:
+        app: titan-notifications
+        phase: "7"
+    spec:
+      containers:
+      - name: notifications
+        image: titan-notifications:phase7
+        ports:
+        - containerPort: 8084
+          name: http
+        - containerPort: 8084
+          name: websocket
+        envFrom:
+        - configMapRef:
+            name: notifications-phase7-config
+        env:
+        - name: VAULT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: vault-token
+              key: token
+        - name: TWILIO_ACCOUNT_SID
+          valueFrom:
+            secretKeyRef:
+              name: twilio-credentials
+              key: account-sid
+        - name: TWILIO_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: twilio-credentials
+              key: auth-token
+        - name: SENDGRID_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: sendgrid-credentials
+              key: api-key
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8084
+          initialDelaySeconds: 60
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8084
+          initialDelaySeconds: 30
+          periodSeconds: 5
+        volumeMounts:
+        - name: secrets
+          mountPath: /app/secrets
+          readOnly: true
+      volumes:
+      - name: secrets
+        secret:
+          secretName: kafka-ssl-secrets
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: titan-notifications-phase7
+  namespace: titan-banking
+spec:
+  selector:
+    app: titan-notifications
+    phase: "7"
+  ports:
+  - name: http
+    port: 8084
+    targetPort: 8084
+  - name: websocket
+    port: 8084
+    targetPort: 8084
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: titan-notifications-hpa
+  namespace: titan-banking
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: titan-notifications-phase7
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80

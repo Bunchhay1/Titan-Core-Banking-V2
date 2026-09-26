@@ -1,0 +1,44 @@
+# Promotions Service GraphQL Schema
+
+type Query {
+    promotionsByRegionAndStatus(region: String!, status: String!, unspent: Boolean): [PromotionAggregate!]!
+    leaderboard(campaignId: ID!, limit: Int): [LeaderboardEntry!]!
+    activeCampaigns: [Campaign!]!
+    userRewards(userId: ID!): UserRewards
+}
+
+type Subscription {
+    leaderboardUpdates(campaignId: ID!): LeaderboardEntry!
+}
+
+# Standalone User rewards type (no Federation in local mode)
+type UserRewards {
+    id: ID!
+    activeRewards: [PromotionAggregate!]!
+}
+
+type PromotionAggregate {
+    accountId: ID!
+    userName: String!
+    region: String!
+    promotionType: String!
+    rewardAmount: String!
+    spent: Boolean!
+}
+
+type LeaderboardEntry {
+    campaignId: ID!
+    accountId: ID!
+    rank: Int!
+    totalSpent: String!
+    rewardEarned: String!
+}
+
+type Campaign {
+    id: ID!
+    name: String!
+    description: String!
+    startDate: String!
+    endDate: String!
+    active: Boolean!
+}

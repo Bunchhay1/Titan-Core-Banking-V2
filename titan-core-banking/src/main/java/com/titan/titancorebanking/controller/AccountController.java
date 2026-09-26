@@ -8,6 +8,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -43,8 +44,9 @@ public class AccountController {
         return ResponseEntity.ok(accountService.getMyAccounts(userDetails.getUsername()));
     }
 
-    // ✅ Endpoint: Get Account By ID (internal — used by titan-loans-service)
+    // ✅ Endpoint: Get Account By ID (Enforce IDOR & ownership check or ADMIN)
     @GetMapping("/{id}")
+    @PreAuthorize("@accountSecurity.isAccountOwner(authentication, #id) or hasRole('ADMIN')")
     public ResponseEntity<Account> getAccountById(@PathVariable Long id) {
         return accountService.getAccountById(id)
                 .map(ResponseEntity::ok)

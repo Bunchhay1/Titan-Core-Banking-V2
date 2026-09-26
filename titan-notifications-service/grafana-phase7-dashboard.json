@@ -1,0 +1,82 @@
+{
+  "dashboard": {
+    "title": "Phase 7: Real-Time Omnichannel Monitoring",
+    "panels": [
+      {
+        "title": "WebSocket Push Latency (P95)",
+        "targets": [{
+          "expr": "histogram_quantile(0.95, rate(websocket_push_duration_seconds_bucket[5m]))"
+        }],
+        "type": "graph"
+      },
+      {
+        "title": "DLQ Message Count (Chaos Drill)",
+        "targets": [{
+          "expr": "sum(rate(kafka_dlq_messages_total[5m]))"
+        }],
+        "type": "graph"
+      },
+      {
+        "title": "Vault Credential Refresh Success Rate",
+        "targets": [{
+          "expr": "rate(vault_credential_refresh_success_total[1h]) / rate(vault_credential_refresh_attempts_total[1h])"
+        }],
+        "type": "gauge"
+      },
+      {
+        "title": "PII Redaction Performance",
+        "targets": [{
+          "expr": "histogram_quantile(0.99, rate(pii_redaction_duration_seconds_bucket[5m]))"
+        }],
+        "type": "graph"
+      },
+      {
+        "title": "Batch Aggregation Ratio",
+        "targets": [{
+          "expr": "(sum(rate(notifications_batched_total[5m])) / sum(rate(notifications_sent_total[5m]))) * 100"
+        }],
+        "type": "stat"
+      },
+      {
+        "title": "Multi-Region Consumer Lag",
+        "targets": [{
+          "expr": "sum(kafka_consumer_lag) by (region)"
+        }],
+        "type": "graph"
+      },
+      {
+        "title": "S/MIME Signing Duration",
+        "targets": [{
+          "expr": "histogram_quantile(0.95, rate(smime_signing_duration_seconds_bucket[5m]))"
+        }],
+        "type": "graph"
+      },
+      {
+        "title": "Inbound Webhook Rate",
+        "targets": [{
+          "expr": "sum(rate(webhook_requests_total[5m])) by (provider)"
+        }],
+        "type": "graph"
+      },
+      {
+        "title": "Predictive Delivery Queue Depth",
+        "targets": [{
+          "expr": "redis_scheduled_notifications_count"
+        }],
+        "type": "stat"
+      },
+      {
+        "title": "Archival Job Status",
+        "targets": [{
+          "expr": "spring_batch_job_status{job_name=\"archivalJob\"}"
+        }],
+        "type": "stat"
+      }
+    ],
+    "refresh": "5s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    }
+  }
+}

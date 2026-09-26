@@ -2,9 +2,13 @@ package com.titan.titancorebanking.repository;
 
 import com.titan.titancorebanking.model.QrPayment;
 import com.titan.titancorebanking.model.QrPayment.QrStatus;
+import jakarta.persistence.LockModeType;
+import jakarta.persistence.QueryHint;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
@@ -14,6 +18,12 @@ import java.util.Optional;
 
 @Repository
 public interface QrPaymentRepository extends JpaRepository<QrPayment, Long> {
+
+    // ✅ Pessimistic row-level lock on QR code to prevent double redemption race conditions
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
+    @Query("SELECT q FROM QrPayment q WHERE q.qrCode = :qrCode")
+    Optional<QrPayment> findByQrCodeWithLock(@Param("qrCode") String qrCode);
 
     // ✅ Look up a QR by its token (called when payer scans)
     Optional<QrPayment> findByQrCode(String qrCode);

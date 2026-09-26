@@ -1,0 +1,131 @@
+# =============================================================================
+# render.yaml — titan-notifications-service (standalone deploy file)
+#
+# How to use:
+#   1. Push the entire Titan_Project repo to GitHub
+#   2. Go to render.com → New → Blueprint → select your repo
+#   3. Render reads this file automatically
+#   4. Fill in all variables marked [RENDER DASHBOARD] in the Render UI
+#
+# NOTE: dockerContext is "." (repo ROOT) because the Dockerfile needs
+#       titan-event-consumer-lib/ which sits next to this service.
+# =============================================================================
+
+services:
+  - type: web
+    name: titan-notifications-service
+    runtime: docker
+
+    # ── Build context = repo root (needed for titan-event-consumer-lib) ───
+    dockerfilePath: ./titan-notifications-service/Dockerfile
+    dockerContext: .
+
+    plan: free
+    healthCheckPath: /actuator/health
+
+    envVars:
+      # ── Spring ─────────────────────────────────────────────────────────
+      - key: SPRING_PROFILES_ACTIVE
+        value: "render"
+
+      - key: JAVA_OPTS
+        value: "-Xmx400m -Xms200m"
+
+      # ── Database [AUTO — injected by Render from managed Postgres] ─────
+      - key: DB_HOST
+        fromDatabase:
+          name: titan-notifications-db
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: titan-notifications-db
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: titan-notifications-db
+          property: database
+      - key: DB_USERNAME
+        fromDatabase:
+          name: titan-notifications-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: titan-notifications-db
+          property: password
+      - key: SPRING_DATASOURCE_URL
+        fromDatabase:
+          name: titan-notifications-db
+          property: connectionString
+
+      # ── Kafka — Confluent Cloud ─────────────────────────────────────────
+      # [RENDER DASHBOARD] Sign up free at https://confluent.cloud
+      # Cluster Settings → Bootstrap server URL
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+        value: "REPLACE_WITH_CONFLUENT_BOOTSTRAP_SERVER"
+      # Confluent Cloud → API Keys → Create Key → copy Key (username)
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+        value: "REPLACE_WITH_CONFLUENT_API_KEY"
+      # Confluent Cloud → API Keys → Create Key → copy Secret (password)
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+        value: "REPLACE_WITH_CONFLUENT_API_SECRET"
+      # Keep these fixed — Confluent Cloud always uses SASL_SSL + PLAIN
+      - key: KAFKA_SECURITY_PROTOCOL
+        value: "SASL_SSL"
+      - key: KAFKA_SASL_MECHANISM
+        value: "PLAIN"
+      - key: KAFKA_ENABLED
+        value: "false"
+
+      # ── Core Banking URL ────────────────────────────────────────────────
+      # URL of titan-core-banking on Render (used for REST calls)
+      - key: CORE_BANKING_URL
+        value: "https://titan-core-banking.onrender.com"
+
+      # ── Redis — DISABLED (no free Redis on Render) ─────────────────────
+      # To enable: sign up at https://upstash.com and paste the host here
+      - key: REDIS_HOST
+        sync: false
+        value: "localhost"
+      - key: REDIS_PORT
+        value: "6379"
+
+      # ── Email — SendGrid ────────────────────────────────────────────────
+      # [RENDER DASHBOARD] Sign up free at https://sendgrid.com
+      # Settings → API Keys → Create API Key
+      - key: SENDGRID_API_KEY
+        sync: false
+        value: "REPLACE_WITH_SENDGRID_API_KEY"
+
+      # ── SMS — Twilio (optional) ─────────────────────────────────────────
+      # [RENDER DASHBOARD] Sign up at https://twilio.com (free trial)
+      # Leave blank to disable SMS
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+        value: ""
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+        value: ""
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+        value: ""
+
+      # ── Notification settings ────────────────────────────────────────────
+      - key: NOTIFICATION_EMAIL_ENABLED
+        value: "true"
+      - key: NOTIFICATION_TELEGRAM_ENABLED
+        value: "false"
+      - key: NOTIFICATION_HIGH_VALUE_THRESHOLD
+        value: "500.00"
+
+      # ── Vault — DISABLED ─────────────────────────────────────────────────
+      - key: VAULT_ENABLED
+        value: "false"
+
+databases:
+  - name: titan-notifications-db
+    plan: free
+    databaseName: notificationsdb
+    user: notificationsuser

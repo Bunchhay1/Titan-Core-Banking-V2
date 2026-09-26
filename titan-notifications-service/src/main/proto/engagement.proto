@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package titan.ai;
+
+option java_package = "com.titan.notifications.grpc";
+option java_outer_classname = "EngagementProto";
+
+service EngagementService {
+  rpc GetOptimalDeliveryTime(EngagementRequest) returns (EngagementResponse);
+}
+
+message EngagementRequest {
+  string user_id = 1;
+  string notification_type = 2;
+}
+
+message EngagementResponse {
+  int64 optimal_timestamp = 1;
+  double confidence_score = 2;
+  bool send_immediately = 3;
+}

@@ -3,6 +3,7 @@ package com.titan.titancorebanking.config;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.authentication.AuthenticationProvider;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -15,6 +16,7 @@ import lombok.RequiredArgsConstructor;
 
 @Configuration
 @EnableWebSecurity
+@EnableMethodSecurity(prePostEnabled = true)
 @RequiredArgsConstructor
 public class SecurityConfig {
 
@@ -47,9 +49,8 @@ public class SecurityConfig {
                         // Internal endpoint called by titan-loans-service to deduct processing fees.
                         // Only reachable within the Docker/K8s internal network.
                         .requestMatchers("/api/v1/transactions/internal/**").permitAll()
-                        // Internal endpoint called by titan-loans-service to fetch account info by ID.
-                        // Only reachable within the Docker/K8s internal network.
-                        .requestMatchers("/api/v1/accounts/{id}").permitAll()
+                        // ✅ Secure account access endpoint: requires authentication & method-level ownership check
+                        .requestMatchers("/api/v1/accounts/{id}").authenticated()
                         // ✅ QR Payment endpoints (/api/v1/qr/**) are intentionally NOT
                         // whitelisted here – they require a valid JWT token.
                         // Lock down everything else

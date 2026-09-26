@@ -1,0 +1,21 @@
+# IDE and OS files
+.DS_Store
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# Build artifacts
+target/
+build/
+*.class
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+scratch/

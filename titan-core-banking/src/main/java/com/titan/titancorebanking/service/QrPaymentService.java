@@ -59,6 +59,7 @@ public class QrPaymentService {
     private final TransactionRepository   transactionRepository;
     private final PasswordEncoder         passwordEncoder;
     private final EventPublisherService   eventPublisherService;
+    private final AccountBucketService    accountBucketService;
 
     // =============================================================================
     // 1. GENERATE QR
@@ -125,8 +126,8 @@ public class QrPaymentService {
      */
     @Transactional
     public QrPaymentResponse payByQr(PayByQrRequest request, String username) {
-        // 1️⃣  Look up the QR record
-        QrPayment qrPayment = qrPaymentRepository.findByQrCode(request.qrCode())
+        // 1️⃣  Acquire pessimistic write lock on the QR entity first to prevent double-spend
+        QrPayment qrPayment = qrPaymentRepository.findByQrCodeWithLock(request.qrCode())
                 .orElseThrow(() -> new IllegalArgumentException("Invalid QR code."));
 
         // 2️⃣  Check QR status and expiry
@@ -138,11 +139,16 @@ public class QrPaymentService {
             qrPaymentRepository.save(qrPayment);
             throw new IllegalStateException("QR code has expired.");
         }
-        if (!isAccountQr && qrPayment.getStatus() == QrStatus.COMPLETED) {
+        if (!isAccountQr && qrPayment.getStatus() != QrStatus.PENDING) {
             throw new IllegalStateException("QR code has already been used.");
         }
         if (qrPayment.getStatus() == QrStatus.CANCELLED) {
             throw new IllegalStateException("QR code has been cancelled.");
+        }
+
+        // Mark status as COMPLETED immediately for non-permanent QRs
+        if (!isAccountQr) {
+            qrPayment.setStatus(QrStatus.COMPLETED);
         }
 
         // 3️⃣  Resolve payer account and verify ownership
@@ -169,29 +175,45 @@ public class QrPaymentService {
             throw new IllegalArgumentException("You cannot pay yourself via QR.");
         }
 
-        // 7️⃣  Balance check
-        if (payer.getBalance().compareTo(paymentAmount) < 0) {
+        // 7️⃣  Deterministic row-level locking (min(id) -> max(id)) to guarantee deadlock-free execution
+        Long payerId = payer.getId();
+        Long payeeId = payee.getId();
+        Account payerLocked;
+        Account payeeLocked;
+
+        if (payerId < payeeId) {
+            payerLocked = accountRepository.findByIdWithLock(payerId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + payerId));
+            payeeLocked = accountRepository.findByIdWithLock(payeeId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payee account not found: " + payeeId));
+        } else {
+            payeeLocked = accountRepository.findByIdWithLock(payeeId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payee account not found: " + payeeId));
+            payerLocked = accountRepository.findByIdWithLock(payerId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + payerId));
+        }
+
+        // 8️⃣  Balance check on locked entity
+        if (payerLocked.getBalance().compareTo(paymentAmount) < 0) {
             throw new IllegalStateException("Insufficient balance.");
         }
 
-        // 8️⃣  Move funds (lock in consistent order to prevent deadlock)
-        boolean lockPayerFirst = payer.getAccountNumber()
-                .compareTo(payee.getAccountNumber()) < 0;
+        // 9️⃣  Move funds (Debit Payer, Credit Payee Partitioned Bucket)
+        payerLocked.setBalance(payerLocked.getBalance().subtract(paymentAmount));
+        accountRepository.save(payerLocked);
 
-        Account first  = lockPayerFirst ? payer : payee;
-        Account second = lockPayerFirst ? payee : payer;
-        accountRepository.findById(first.getId());   // pessimistic lock via @Lock in findByAccountNumber
-        accountRepository.findById(second.getId());
+        int bucketIdx = accountBucketService.selectRandomBucketIndex();
+        try {
+            accountBucketService.creditBucket(payeeLocked.getId(), bucketIdx, paymentAmount);
+        } catch (Exception e) {
+            payeeLocked.setBalance(payeeLocked.getBalance().add(paymentAmount));
+            accountRepository.save(payeeLocked);
+        }
 
-        payer.setBalance(payer.getBalance().subtract(paymentAmount));
-        payee.setBalance(payee.getBalance().add(paymentAmount));
-        accountRepository.save(payer);
-        accountRepository.save(payee);
-
-        // 9️⃣  Record Transaction
+        // 🔟  Record Transaction
         Transaction tx = Transaction.builder()
-                .fromAccount(payer)
-                .toAccount(payee)
+                .fromAccount(payerLocked)
+                .toAccount(payeeLocked)
                 .amount(paymentAmount)
                 .transactionType(TransactionType.PAYMENT)
                 .status(TransactionStatus.SUCCESS)
@@ -201,18 +223,18 @@ public class QrPaymentService {
                 .build();
         transactionRepository.save(tx);
 
-        // 🔟  Update QR record (keep persistent Account QR as PENDING for reuse)
+        // 1️⃣1️⃣ Update QR record
         if (!isAccountQr) {
             qrPayment.setStatus(QrStatus.COMPLETED);
         } else {
             qrPayment.setStatus(QrStatus.PENDING);
         }
-        qrPayment.setPayerAccount(payer);
+        qrPayment.setPayerAccount(payerLocked);
         qrPayment.setTransaction(tx);
         qrPayment.setPaidAt(LocalDateTime.now());
         qrPaymentRepository.save(qrPayment);
 
-        // 1️⃣1️⃣ Publish Event via Outbox/Kafka for Real-time Notifications
+        // 1️⃣2️⃣ Publish Event via Outbox/Kafka for Real-time Notifications
         try {
             eventPublisherService.publishTransactionCompletedEvent(tx);
         } catch (Exception e) {
@@ -220,8 +242,8 @@ public class QrPaymentService {
         }
 
         log.info("✅ QR payment completed: qrCode={} payer={} payee={} amount={}",
-                request.qrCode(), payer.getAccountNumber(),
-                payee.getAccountNumber(), paymentAmount);
+                request.qrCode(), payerLocked.getAccountNumber(),
+                payeeLocked.getAccountNumber(), paymentAmount);
 
         return toResponse(qrPayment, null);
     }
@@ -302,8 +324,8 @@ public class QrPaymentService {
      */
     @Transactional
     public QrPaymentResponse collectByQr(CollectByQrRequest request, String username) {
-        // 1️⃣  Look up QR
-        QrPayment qrPayment = qrPaymentRepository.findByQrCode(request.qrCode())
+        // 1️⃣  Acquire pessimistic write lock on the QR entity first to prevent double-spend
+        QrPayment qrPayment = qrPaymentRepository.findByQrCodeWithLock(request.qrCode())
                 .orElseThrow(() -> new IllegalArgumentException("Invalid QR code."));
 
         // 2️⃣  Must be a payer-generated QR
@@ -319,12 +341,15 @@ public class QrPaymentService {
             qrPaymentRepository.save(qrPayment);
             throw new IllegalStateException("QR code has expired.");
         }
-        if (qrPayment.getStatus() == QrStatus.COMPLETED) {
+        if (qrPayment.getStatus() != QrStatus.PENDING) {
             throw new IllegalStateException("QR code has already been collected.");
         }
         if (qrPayment.getStatus() == QrStatus.CANCELLED) {
             throw new IllegalStateException("QR code has been cancelled.");
         }
+
+        // Mark as completed immediately under lock
+        qrPayment.setStatus(QrStatus.COMPLETED);
 
         // 4️⃣  Resolve collector account and verify ownership
         Account collector = accountRepository
@@ -344,24 +369,48 @@ public class QrPaymentService {
             throw new IllegalArgumentException("You cannot collect a QR into the same account.");
         }
 
-        // 7️⃣  Re-check balance (may have changed since QR was generated)
+        // 7️⃣  Deterministic row-level locking (min(id) -> max(id)) to guarantee deadlock-free execution
+        Long payerId = payer.getId();
+        Long collectorId = collector.getId();
+        Account payerLocked;
+        Account collectorLocked;
+
+        if (payerId < collectorId) {
+            payerLocked = accountRepository.findByIdWithLock(payerId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + payerId));
+            collectorLocked = accountRepository.findByIdWithLock(collectorId)
+                    .orElseThrow(() -> new IllegalArgumentException("Collector account not found: " + collectorId));
+        } else {
+            collectorLocked = accountRepository.findByIdWithLock(collectorId)
+                    .orElseThrow(() -> new IllegalArgumentException("Collector account not found: " + collectorId));
+            payerLocked = accountRepository.findByIdWithLock(payerId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + payerId));
+        }
+
+        // 8️⃣  Re-check balance on locked entity (may have changed since QR was generated)
         BigDecimal amount = qrPayment.getAmount();
-        if (payer.getBalance().compareTo(amount) < 0) {
+        if (payerLocked.getBalance().compareTo(amount) < 0) {
             throw new IllegalStateException(
                     "Payer's account no longer has sufficient balance.");
         }
 
-        // 8️⃣  Move funds
-        payer.setBalance(payer.getBalance().subtract(amount));
-        collector.setBalance(collector.getBalance().add(amount));
-        accountRepository.save(payer);
-        accountRepository.save(collector);
+        // 9️⃣  Move funds (Debit Payer, Credit Collector Partitioned Bucket)
+        payerLocked.setBalance(payerLocked.getBalance().subtract(amount));
+        accountRepository.save(payerLocked);
 
-        // 9️⃣  Record transaction
+        int bucketIdx = accountBucketService.selectRandomBucketIndex();
+        try {
+            accountBucketService.creditBucket(collectorLocked.getId(), bucketIdx, amount);
+        } catch (Exception e) {
+            collectorLocked.setBalance(collectorLocked.getBalance().add(amount));
+            accountRepository.save(collectorLocked);
+        }
+
+        // 🔟  Record transaction
         String memo = qrPayment.getNote().substring("PAYER_QR:".length());
         Transaction tx = Transaction.builder()
-                .fromAccount(payer)
-                .toAccount(collector)
+                .fromAccount(payerLocked)
+                .toAccount(collectorLocked)
                 .amount(amount)
                 .transactionType(TransactionType.PAYMENT)
                 .status(TransactionStatus.SUCCESS)
@@ -371,16 +420,16 @@ public class QrPaymentService {
                 .build();
         transactionRepository.save(tx);
 
-        // 🔟  Update QR record — swap payerAccount/payeeAccount for the response
+        // 1️⃣1️⃣ Update QR record — swap payerAccount/payeeAccount for the response
         qrPayment.setStatus(QrStatus.COMPLETED);
-        qrPayment.setPayerAccount(payer);
+        qrPayment.setPayerAccount(payerLocked);
         qrPayment.setTransaction(tx);
         qrPayment.setPaidAt(LocalDateTime.now());
         // Store collector in payeeAccount so the response shows correct direction
-        qrPayment.setPayeeAccount(collector);
+        qrPayment.setPayeeAccount(collectorLocked);
         qrPaymentRepository.save(qrPayment);
 
-        // 1️⃣1️⃣ Publish Event via Outbox/Kafka for Real-time Notifications
+        // 1️⃣2️⃣ Publish Event via Outbox/Kafka for Real-time Notifications
         try {
             eventPublisherService.publishTransactionCompletedEvent(tx);
         } catch (Exception e) {
@@ -388,8 +437,8 @@ public class QrPaymentService {
         }
 
         log.info("✅ Payer QR collected: qrCode={} payer={} collector={} amount={}",
-                request.qrCode(), payer.getAccountNumber(),
-                collector.getAccountNumber(), amount);
+                request.qrCode(), payerLocked.getAccountNumber(),
+                collectorLocked.getAccountNumber(), amount);
 
         return toResponse(qrPayment, null);
     }

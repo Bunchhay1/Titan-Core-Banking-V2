@@ -47,6 +47,7 @@ public class AccountService {
     private final OtpService otpService;
     private final StringRedisTemplate redisTemplate;
     private final ExchangeRateService exchangeRateService;
+    private final AccountBucketService accountBucketService;
 
     // @Lazy breaks the circular dependency:
     //   AccountService → QrPaymentService → AccountRepository (← same bean AccountService uses)
@@ -112,12 +113,17 @@ public class AccountService {
 
         account = accountRepository.save(account);
 
+        // ✅ Pre-initialize partitioned balance buckets for the account
+        try {
+            accountBucketService.getOrInitializeBuckets(account);
+        } catch (Exception e) {
+            log.debug("Could not pre-init buckets: {}", e.getMessage());
+        }
+
         // ✅ Auto-create a permanent account QR so the iOS app can show it immediately.
-        // This is fire-and-forget — if it fails for any reason we log the error but
-        // do NOT roll back the account creation itself.
         try {
             qrPaymentService.getOrCreateAccountQr(account.getAccountNumber(), username);
-            log.info("✅ Account QR auto-created for new account: {}", account.getAccountNumber());
+            log.debug("Account QR auto-created for new account: {}", account.getAccountNumber());
         } catch (Exception e) {
             log.warn("⚠️ Could not auto-create account QR for {}: {}", account.getAccountNumber(), e.getMessage());
         }
@@ -172,7 +178,6 @@ public class AccountService {
         BigDecimal targetAmount = sourceAmount;
 
         if (fromAccount.getCurrency() != toAccount.getCurrency()) {
-            log.info("💱 FX Transfer: {} -> {}", fromAccount.getCurrency(), toAccount.getCurrency());
             targetAmount = exchangeRateService.convert(sourceAmount, fromAccount.getCurrency(), toAccount.getCurrency());
         }
 
@@ -234,18 +239,27 @@ public class AccountService {
 
     @Transactional(readOnly = true)
     public List<Account> getMyAccounts(String username) {
-        return accountRepository.findByUserUsername(username);
+        List<Account> accounts = accountRepository.findByUserUsername(username);
+        for (Account account : accounts) {
+            BigDecimal aggregated = accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance());
+            account.setBalance(aggregated);
+        }
+        return accounts;
     }
 
     @Transactional(readOnly = true)
     public java.util.Optional<Account> getAccountById(Long id) {
-        return accountRepository.findById(id);
+        return accountRepository.findById(id).map(account -> {
+            BigDecimal aggregated = accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance());
+            account.setBalance(aggregated);
+            return account;
+        });
     }
 
     @Transactional(readOnly = true)
     public BigDecimal getBalance(String accountNumber) {
         return accountRepository.findByAccountNumber(accountNumber)
-                .map(Account::getBalance)
+                .map(account -> accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance()))
                 .orElse(BigDecimal.ZERO);
     }
 }
