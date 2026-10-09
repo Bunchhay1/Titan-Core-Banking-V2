@@ -133,9 +133,16 @@ public class TransactionService {
             eventPublisherService.publishTransactionCompletedEvent(tx);
 
             return tx;
+        } catch (InsufficientBalanceException | InvalidPinException | AccountLockedException | SecurityException e) {
+            // ✅ FIX: Re-throw business rule violations without audit logging
+            // These should reach GlobalExceptionHandler with proper HTTP status codes
+            log.warn("Business rule violation in transfer: {}", e.getMessage());
+            throw e;
         } catch (Exception e) {
+            // ✅ FIX: Only infrastructure/unexpected exceptions are logged as FAILED transactions
+            log.error("Infrastructure failure in transfer: {}", e.getMessage(), e);
             auditService.saveAuditLog(fromAccount, toAccount, request.amount(),
-                    TransactionType.TRANSFER, TransactionStatus.FAILED, "Failed: " + e.getMessage());
+                    TransactionType.TRANSFER, TransactionStatus.FAILED, "System failure: " + e.getMessage());
             throw e;
         }
     }
@@ -191,9 +198,16 @@ public class TransactionService {
 
             eventPublisherService.publishTransactionCompletedEvent(tx);
             return tx;
+        } catch (InsufficientBalanceException | InvalidPinException | AccountLockedException | SecurityException e) {
+            // ✅ FIX: Re-throw business rule violations without audit logging
+            // These should reach GlobalExceptionHandler with proper HTTP status codes
+            log.warn("Business rule violation in withdrawal: {}", e.getMessage());
+            throw e;
         } catch (Exception e) {
+            // ✅ FIX: Only infrastructure/unexpected exceptions are logged as FAILED transactions
+            log.error("Infrastructure failure in withdrawal: {}", e.getMessage(), e);
             auditService.saveAuditLog(account, null, request.amount(),
-                    TransactionType.WITHDRAWAL, TransactionStatus.FAILED, e.getMessage());
+                    TransactionType.WITHDRAWAL, TransactionStatus.FAILED, "System failure: " + e.getMessage());
             throw e;
         }
     }
@@ -247,9 +261,16 @@ public class TransactionService {
 
             eventPublisherService.publishTransactionCompletedEvent(tx);
             return tx;
+        } catch (AccountLockedException | SecurityException e) {
+            // ✅ FIX: Re-throw business rule violations without audit logging
+            // These should reach GlobalExceptionHandler with proper HTTP status codes
+            log.warn("Business rule violation in deposit: {}", e.getMessage());
+            throw e;
         } catch (Exception e) {
+            // ✅ FIX: Only infrastructure/unexpected exceptions are logged as FAILED transactions
+            log.error("Infrastructure failure in deposit: {}", e.getMessage(), e);
             auditService.saveAuditLog(null, account, request.amount(),
-                    TransactionType.DEPOSIT, TransactionStatus.FAILED, e.getMessage());
+                    TransactionType.DEPOSIT, TransactionStatus.FAILED, "System failure: " + e.getMessage());
             throw e;
         }
     }
