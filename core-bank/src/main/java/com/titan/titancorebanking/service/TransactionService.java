@@ -22,6 +22,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
@@ -40,32 +41,29 @@ public class TransactionService {
     private final DeadMansSwitchService deadMansSwitchService;
     private final AccountBucketService accountBucketService;
 
+    // ==================================================================================
+    // 1. TRANSFER
+    // ==================================================================================
     @Transactional
     @Retry(name = "db")
-    public Transaction transfer(TransactionRequest request, String currentUsername) {
+    public Transaction transfer(final TransactionRequest request, final String currentUsername) {
 
-        // [MODIFIED] Replaced generic IllegalStateException with a custom domain exception (AccountLockedException).
-        // ប្រើប្រាស់ Custom Exception ធ្វើអោយ GlobalExceptionHandler ងាយស្រួលចាប់ Error និងត្រឡប់ HTTP 403 / 400 បានត្រឹមត្រូវ។
         if (deadMansSwitchService.isLockdownActive()) {
             throw new AccountLockedException("System is in LOCKDOWN. All transactions are frozen.");
         }
 
-        // [MODIFIED] Extracted validation logic into a private helper method for cleaner code.
-        // ផ្តាច់កូដដែលឆែក Input ទៅជា Method ដាច់ដោយឡែក ដើម្បីអោយកូដមេ (Main flow) ខ្លី និងស្រួលអានជាងមុន។
         validateTransferInput(request);
 
-        // [MODIFIED] Simplified Optional extraction using functional ifPresent().
-        // កាត់បន្ថយកូដជាន់គ្នា (Boilerplate) ពេលទាញយកទិន្នន័យពី Idempotency Cache។
         var existingTx = idempotencyService.getTransaction(request.idempotencyKey(), "/api/v1/transactions/transfer");
         if (existingTx.isPresent()) {
-            log.warn("Duplicate request detected: {}", request.idempotencyKey());
+            log.warn("Duplicate transfer request detected: {}", request.idempotencyKey());
             return existingTx.get();
         }
 
         return executeSecureTransfer(request, currentUsername);
     }
 
-    protected Transaction executeSecureTransfer(TransactionRequest request, String currentUsername) {
+    protected Transaction executeSecureTransfer(final TransactionRequest request, final String currentUsername) {
         Account rawFrom = accountRepository.findByAccountNumber(request.fromAccountNumber())
                 .orElseThrow(() -> new IllegalArgumentException("Source account not found: " + request.fromAccountNumber()));
         Account rawTo = accountRepository.findByAccountNumber(request.toAccountNumber())
@@ -75,8 +73,6 @@ public class TransactionService {
             throw new IllegalArgumentException("Source and destination accounts cannot have the same ID.");
         }
 
-        // [MODIFIED] Moved AI Risk Engine evaluation to a separate private method.
-        // ញែក Logic របស់ AI ទៅក្រៅ ដើម្បីកុំអោយប៉ះពាល់ដល់ Readability នៃ Core Transfer Logic។
         Transaction blockedTx = checkRiskEngine(rawFrom, rawTo, request.amount());
         if (blockedTx != null) return blockedTx;
 
@@ -94,16 +90,12 @@ public class TransactionService {
         Account fromAccount = firstLocked.getId().equals(rawFrom.getId()) ? firstLocked : secondLocked;
         Account toAccount = firstLocked.getId().equals(rawTo.getId()) ? firstLocked : secondLocked;
 
-        // [MODIFIED] Consolidated Ownership and PIN validation into a reusable method.
-        // បង្រួមការផ្ទៀងផ្ទាត់ PIN និងម្ចាស់គណនី (Ownership) អោយមានស្តង់ដាររួមមួយ ដែលអាចយកទៅប្រើនៅ Withdrawal បាន។
         validateOwnershipAndPin(fromAccount, currentUsername, request.pin());
 
         try {
             BigDecimal fee = calculateFee(fromAccount);
             BigDecimal totalDeduction = request.amount().add(fee);
 
-            // [MODIFIED] Throw custom InsufficientBalanceException instead of a generic RuntimeException.
-            // ប្រើ Exception ជាក់លាក់ ដើម្បីបញ្ជាក់ថាបញ្ហាមកពីទឹកប្រាក់មិនគ្រប់គ្រាន់ពិតប្រាកដមែន។
             if (fromAccount.getBalance().compareTo(totalDeduction) < 0) {
                 throw new InsufficientBalanceException("Insufficient Funds. Balance: " + fromAccount.getBalance());
             }
@@ -116,11 +108,10 @@ public class TransactionService {
                 note += String.format(" [FX: %s -> %s]", fromAccount.getCurrency(), toAccount.getCurrency());
             }
 
-            // [MODIFIED] Cleaned up Bucket crediting fallback logging.
-            // ដកប្រាក់ពីអ្នកផ្ញើ និងបន្ថែមប្រាក់ទៅអ្នកទទួល ដោយមាន Log បញ្ជាក់ច្បាស់លាស់ពេល Fallback ដំណើរការ។
             fromAccount.setBalance(fromAccount.getBalance().subtract(totalDeduction));
             accountRepository.save(fromAccount);
 
+            // Deposit into high-concurrency bucket
             try {
                 accountBucketService.creditBucket(toAccount.getId(), accountBucketService.selectRandomBucketIndex(), targetAmount);
             } catch (Exception e) {
@@ -129,21 +120,15 @@ public class TransactionService {
                 accountRepository.save(toAccount);
             }
 
-            // Save transaction with idempotency key
             Transaction tx = auditService.saveAuditLog(fromAccount, toAccount, request.amount(),
                     TransactionType.TRANSFER, TransactionStatus.SUCCESS, note);
 
             if (request.idempotencyKey() != null) {
                 tx.setIdempotencyKey(request.idempotencyKey());
                 transactionRepository.save(tx);
-                idempotencyService.cacheTransaction(
-                        request.idempotencyKey(),
-                        "/api/v1/transactions/transfer",
-                        tx
-                );
+                idempotencyService.cacheTransaction(request.idempotencyKey(), "/api/v1/transactions/transfer", tx);
             }
 
-            // Create double-entry ledger entries and Publish Outbox Event
             doubleEntryService.createDoubleEntry(tx.getId(), fromAccount.getId(), toAccount.getId(), request.amount(), note, currentUsername);
             eventPublisherService.publishTransactionCompletedEvent(tx);
 
@@ -155,9 +140,144 @@ public class TransactionService {
         }
     }
 
-    // [MODIFIED] Helper method for input validation (Clean Code: Extract Method).
-    // បង្កើត Method ថ្មីសម្រាប់ត្រួតពិនិត្យ Input ទិន្នន័យ ដើម្បីងាយស្រួលរក្សាកូដអោយស្អាត។
-    private void validateTransferInput(TransactionRequest request) {
+    // ==================================================================================
+    // 2. WITHDRAWAL
+    // ==================================================================================
+    @Transactional
+    @Retry(name = "db")
+    public Transaction withdraw(final TransactionRequest request, final String currentUsername) {
+
+        if (deadMansSwitchService.isLockdownActive()) {
+            throw new AccountLockedException("System is in LOCKDOWN. All transactions are frozen.");
+        }
+
+        if (request.fromAccountNumber() == null || request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Valid source account number and positive amount are required.");
+        }
+
+        var existingTx = idempotencyService.getTransaction(request.idempotencyKey(), "/api/v1/transactions/withdraw");
+        if (existingTx.isPresent()) {
+            log.warn("Duplicate withdraw request detected: {}", request.idempotencyKey());
+            return existingTx.get();
+        }
+
+        // [MODIFIED] Closed the TOCTOU race condition by verifying PIN strictly against the row-locked entity.
+        // ចាប់យក Pessimistic Lock ជាមុន ទើបផ្ទៀងផ្ទាត់ PIN និងម្ចាស់គណនី ដើម្បីការពារមិនឲ្យមានអ្នកផ្លាស់ប្តូរលេខសម្ងាត់ចន្លោះពេលកំពុងដកប្រាក់។
+        Account account = accountRepository.findByAccountNumberWithLock(request.fromAccountNumber())
+                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + request.fromAccountNumber()));
+
+        validateOwnershipAndPin(account, currentUsername, request.pin());
+
+        try {
+            BigDecimal fee = calculateFee(account);
+            BigDecimal totalDeduction = request.amount().add(fee);
+
+            if (account.getBalance().compareTo(totalDeduction) < 0) {
+                throw new InsufficientBalanceException("Insufficient Funds. Balance: " + account.getBalance());
+            }
+
+            account.setBalance(account.getBalance().subtract(totalDeduction));
+            accountRepository.save(account);
+
+            String note = "Withdrawal" + (request.note() != null ? " - " + request.note() : "");
+            Transaction tx = auditService.saveAuditLog(account, null, request.amount(),
+                    TransactionType.WITHDRAWAL, TransactionStatus.SUCCESS, note);
+
+            if (request.idempotencyKey() != null) {
+                tx.setIdempotencyKey(request.idempotencyKey());
+                transactionRepository.save(tx);
+                idempotencyService.cacheTransaction(request.idempotencyKey(), "/api/v1/transactions/withdraw", tx);
+            }
+
+            eventPublisherService.publishTransactionCompletedEvent(tx);
+            return tx;
+        } catch (Exception e) {
+            auditService.saveAuditLog(account, null, request.amount(),
+                    TransactionType.WITHDRAWAL, TransactionStatus.FAILED, e.getMessage());
+            throw e;
+        }
+    }
+
+    // ==================================================================================
+    // 3. DEPOSIT
+    // ==================================================================================
+    @Transactional
+    @Retry(name = "db")
+    public Transaction deposit(final TransactionRequest request) {
+
+        if (deadMansSwitchService.isLockdownActive()) {
+            throw new AccountLockedException("System is in LOCKDOWN. All transactions are frozen.");
+        }
+
+        String targetAccNum = request.toAccountNumber() != null ? request.toAccountNumber() : request.fromAccountNumber();
+
+        if (targetAccNum == null || request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Valid destination account number and positive amount are required.");
+        }
+
+        var existingTx = idempotencyService.getTransaction(request.idempotencyKey(), "/api/v1/transactions/deposit");
+        if (existingTx.isPresent()) {
+            log.warn("Duplicate deposit request detected: {}", request.idempotencyKey());
+            return existingTx.get();
+        }
+
+        Account account = accountRepository.findByAccountNumberWithLock(targetAccNum)
+                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + targetAccNum));
+
+        try {
+            // [MODIFIED] Redirected deposits through the AccountBucketService to absorb high concurrency.
+            // រុញការដាក់ប្រាក់ចូលទៅកាន់ Bucket Partitioning ដើម្បីកុំឲ្យ Database គាំងនៅពេលមានមនុស្សដាក់ប្រាក់ចូលគណនីតែមួយ (Hot Account) រាប់ពាន់ដងក្នុង១វិនាទី។
+            try {
+                accountBucketService.creditBucket(account.getId(), accountBucketService.selectRandomBucketIndex(), request.amount());
+            } catch (Exception e) {
+                log.warn("Bucket credit failed, falling back to direct parent account update for ID: {}", account.getId());
+                account.setBalance(account.getBalance().add(request.amount()));
+                accountRepository.save(account);
+            }
+
+            String note = "Deposit" + (request.note() != null ? " - " + request.note() : "");
+            Transaction tx = auditService.saveAuditLog(null, account, request.amount(),
+                    TransactionType.DEPOSIT, TransactionStatus.SUCCESS, note);
+
+            if (request.idempotencyKey() != null) {
+                tx.setIdempotencyKey(request.idempotencyKey());
+                transactionRepository.save(tx);
+                idempotencyService.cacheTransaction(request.idempotencyKey(), "/api/v1/transactions/deposit", tx);
+            }
+
+            eventPublisherService.publishTransactionCompletedEvent(tx);
+            return tx;
+        } catch (Exception e) {
+            auditService.saveAuditLog(null, account, request.amount(),
+                    TransactionType.DEPOSIT, TransactionStatus.FAILED, e.getMessage());
+            throw e;
+        }
+    }
+
+    // ==================================================================================
+    // HISTORY & READ METHODS
+    // ==================================================================================
+    @Transactional(readOnly = true)
+    public List<TransactionResponse> getTransactionHistory(final String username) {
+        List<Transaction> transactions = transactionRepository.findAllByUser(username);
+        return transactions.stream().map(this::toTransactionResponse).toList();
+    }
+
+    @Transactional(readOnly = true)
+    public TransactionResponse getLastTransaction(final String username) {
+        List<Transaction> transactions = transactionRepository.findAllByUser(username);
+        if (transactions.isEmpty()) {
+            throw new IllegalArgumentException("No transactions found for user.");
+        }
+        // Utilizing Java 21 Sequenced Collections interface directly
+        return toTransactionResponse(transactions.getLast());
+    }
+
+    // ==================================================================================
+    // PRIVATE HELPER METHODS
+    // ==================================================================================
+
+    private void validateTransferInput(final TransactionRequest request) {
         if (request.fromAccountNumber() == null || request.toAccountNumber() == null) {
             throw new IllegalArgumentException("Source and destination account numbers are required.");
         }
@@ -169,9 +289,7 @@ public class TransactionService {
         }
     }
 
-    // [MODIFIED] Helper method for AI risk engine logic.
-    // ផ្តាច់ការត្រួតពិនិត្យហានិភ័យ (Risk Evaluation) មកទីនេះ។
-    private Transaction checkRiskEngine(Account from, Account to, BigDecimal amount) {
+    private Transaction checkRiskEngine(final Account from, final Account to, final BigDecimal amount) {
         var riskResponse = riskEngineGrpcService.analyzeTransaction(from.getUser().getId().toString(), amount.doubleValue());
         if ("BLOCK".equalsIgnoreCase(riskResponse.getAction())) {
             log.warn("Transaction BLOCKED by AI Risk Engine: Score={}", riskResponse.getRiskScore());
@@ -180,9 +298,7 @@ public class TransactionService {
         return null;
     }
 
-    // [MODIFIED] Extracted generic PIN and Ownership validator.
-    // បង្កើតស្តង់ដាររួមសម្រាប់ពិនិត្យមើលសិទ្ធិម្ចាស់គណនី និងលេខសម្ងាត់ (PIN)។
-    private void validateOwnershipAndPin(Account account, String username, String pin) {
+    private void validateOwnershipAndPin(final Account account, final String username, final String pin) {
         if (!account.getUser().getUsername().equals(username)) {
             throw new SecurityException("You do not own this account!");
         }
@@ -192,7 +308,7 @@ public class TransactionService {
         }
     }
 
-    private BigDecimal calculateFee(Account account) {
+    private BigDecimal calculateFee(final Account account) {
         return switch (account.getAccountType()) {
             case SAVINGS -> account.getBalance().compareTo(new BigDecimal("10000")) >= 0 ? BigDecimal.ZERO : new BigDecimal("0.50");
             case CHECKING -> new BigDecimal("1.00");
@@ -202,5 +318,27 @@ public class TransactionService {
         };
     }
 
-    // Additional methods like withdraw(), deposit(), getTransactionHistory() follow the same pattern...
+    private TransactionResponse toTransactionResponse(final Transaction tx) {
+        var currency = Optional.ofNullable(tx.getFromAccount())
+                .map(Account::getCurrency)
+                .map(Enum::name)
+                .orElseGet(() -> Optional.ofNullable(tx.getToAccount())
+                        .map(Account::getCurrency)
+                        .map(Enum::name)
+                        .orElse("USD"));
+
+        return new TransactionResponse(
+                tx.getId(),
+                tx.getTransactionType().name(),
+                tx.getAmount(),
+                tx.getFromAccount() != null ? tx.getFromAccount().getAccountNumber() : null,
+                tx.getToAccount() != null ? tx.getToAccount().getAccountNumber() : null,
+                tx.getStatus().name(),
+                tx.getNote(),
+                tx.getTimestamp(),
+                currency,
+                BigDecimal.ZERO,
+                tx.getIdempotencyKey() != null ? tx.getIdempotencyKey() : tx.getTransactionReference()
+        );
+    }
 }
