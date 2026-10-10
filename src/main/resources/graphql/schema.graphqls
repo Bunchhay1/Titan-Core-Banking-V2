@@ -1,0 +1,59 @@
+# Core Banking Subgraph Schema
+# Federation: @key(fields: "id") allows the Supergraph to stitch User
+# across core-banking and promotions-service in a single query.
+
+type Query {
+    user(id: ID!): User
+    account(id: ID!): Account
+    recentTransactions(accountId: ID!, limit: Int): [Transaction!]!
+}
+
+type Subscription {
+    transactionCompleted(accountId: ID!): TransactionEvent!
+}
+
+# Federation key — promotions-service can extend this type
+type User @key(fields: "id") {
+    id: ID!
+    firstName: String!
+    lastName: String!
+    # RBAC: USER role sees masked number only
+    maskedAccountNumber: String
+    # RBAC: ADMIN role only
+    totalLedgerBalance: String @adminOnly
+    accounts: [Account!]!
+}
+
+type Account {
+    id: ID!
+    accountNumber: String!
+    accountType: String!
+    currency: String!
+    balance: String @adminOnly
+    status: String!
+}
+
+type Transaction {
+    id: ID!
+    transactionReference: String!
+    transactionType: String!
+    amount: String!
+    currency: String!
+    status: String!
+    timestamp: String!
+    note: String
+}
+
+type TransactionEvent {
+    transactionId: String!
+    amount: String!
+    currency: String!
+    type: String!
+    status: String!
+    sourceAccountNumber: String!
+    targetAccountNumber: String!
+    timestamp: String!
+}
+
+directive @adminOnly on FIELD_DEFINITION
+directive @key(fields: String!) on OBJECT

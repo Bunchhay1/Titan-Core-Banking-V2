@@ -1,0 +1,269 @@
+package com.titan.titancorebanking.security.redteam;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Task 8: Continuous Automated Red Teaming (CART)
+ *
+ * Runs autonomously in staging namespace. Executes security probes every night:
+ *  - SQL injection attempts on all public endpoints
+ *  - JWT forgery attempts (alg:none, weak secret brute-force)
+ *  - gRPC reflection abuse
+ *  - Path traversal on file endpoints
+ *  - Mass assignment / IDOR probes
+ *
+ * Generates a security report at 06:00 AM daily.
+ * NEVER runs against production — enforced by profile guard.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CartRedTeamService {
+
+    private final WebClient.Builder webClientBuilder;
+
+    @Value("${cart.target.base-url:http://titan-core-banking:8080}")
+    private String targetBaseUrl;
+
+    @Value("${spring.profiles.active:dev}")
+    private String activeProfile;
+
+    private final List<SecurityFinding> findings = new ArrayList<>();
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Nightly red team run: 01:00 AM
+    // ─────────────────────────────────────────────────────────────────────────
+    @Scheduled(cron = "0 0 1 * * *")
+    public void runNightlyRedTeam() {
+        if (!activeProfile.contains("staging")) {
+            log.warn("CART: Skipping — only runs in staging profile. Current: {}", activeProfile);
+            return;
+        }
+
+        findings.clear();
+        log.info("🔴 CART: Starting nightly red team run against {}", targetBaseUrl);
+
+        probeSqlInjection();
+        probeJwtForgery();
+        probePathTraversal();
+        probeIdorAccess();
+        probeGrpcReflection();
+
+        log.info("🔴 CART: Run complete. {} findings.", findings.size());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Morning report: 06:00 AM
+    // ─────────────────────────────────────────────────────────────────────────
+    @Scheduled(cron = "0 0 6 * * *")
+    public void generateDailyReport() {
+        if (!activeProfile.contains("staging")) return;
+
+        StringBuilder report = new StringBuilder();
+        report.append("=== TITAN CART SECURITY REPORT ===\n");
+        report.append("Date: ").append(LocalDate.now()).append("\n");
+        report.append("Target: ").append(targetBaseUrl).append("\n");
+        report.append("Total Findings: ").append(findings.size()).append("\n\n");
+
+        long critical = findings.stream().filter(f -> f.severity() == Severity.CRITICAL).count();
+        long high = findings.stream().filter(f -> f.severity() == Severity.HIGH).count();
+        long medium = findings.stream().filter(f -> f.severity() == Severity.MEDIUM).count();
+
+        report.append(String.format("CRITICAL: %d | HIGH: %d | MEDIUM: %d\n\n", critical, high, medium));
+
+        findings.forEach(f -> report.append(String.format("[%s] %s\n  Endpoint: %s\n  Payload: %s\n  Response: %s\n\n",
+                f.severity(), f.title(), f.endpoint(), f.payload(), f.responseCode())));
+
+        log.warn("\n{}", report);
+        // In production: send to security team via email/Slack webhook
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Probe: SQL Injection
+    // ─────────────────────────────────────────────────────────────────────────
+    private void probeSqlInjection() {
+        List<String> payloads = List.of(
+                "' OR '1'='1",
+                "'; DROP TABLE transactions; --",
+                "1 UNION SELECT username, password FROM users--",
+                "' OR 1=1--",
+                "admin'--"
+        );
+
+        List<String> endpoints = List.of(
+                "/api/v1/users?username=",
+                "/api/v1/accounts?accountNumber=",
+                "/api/v1/transactions?id="
+        );
+
+        for (String endpoint : endpoints) {
+            for (String payload : payloads) {
+                try {
+                    var response = webClientBuilder.baseUrl(targetBaseUrl).build()
+                            .get()
+                            .uri(endpoint + payload)
+                            .header("Authorization", "Bearer invalid-token")
+                            .retrieve()
+                            .toBodilessEntity()
+                            .block();
+
+                    int status = response != null ? response.getStatusCode().value() : 0;
+
+                    // 200 on SQL injection payload = potential vulnerability
+                    if (status == 200) {
+                        findings.add(new SecurityFinding(
+                                Severity.CRITICAL, "Potential SQL Injection",
+                                endpoint, payload, String.valueOf(status),
+                                LocalDateTime.now()
+                        ));
+                        log.error("🚨 CRITICAL: SQL injection may be possible at {}", endpoint);
+                    }
+                } catch (Exception ignored) {
+                    // 4xx/5xx = endpoint is rejecting — expected behavior
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Probe: JWT Forgery (alg:none attack)
+    // ─────────────────────────────────────────────────────────────────────────
+    private void probeJwtForgery() {
+        // alg:none forged token: header.payload. (no signature)
+        String forgedHeader = java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString("{\"alg\":\"none\",\"typ\":\"JWT\"}".getBytes());
+        String forgedPayload = java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString("{\"sub\":\"admin\",\"roles\":[\"ADMIN\"],\"exp\":9999999999}".getBytes());
+        String forgedToken = forgedHeader + "." + forgedPayload + ".";
+
+        try {
+            var response = webClientBuilder.baseUrl(targetBaseUrl).build()
+                    .get()
+                    .uri("/api/v1/admin/users")
+                    .header("Authorization", "Bearer " + forgedToken)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+
+            int status = response != null ? response.getStatusCode().value() : 0;
+            if (status == 200) {
+                findings.add(new SecurityFinding(
+                        Severity.CRITICAL, "JWT alg:none Attack Succeeded",
+                        "/api/v1/admin/users", "alg:none forged token", String.valueOf(status),
+                        LocalDateTime.now()
+                ));
+                log.error("🚨 CRITICAL: JWT alg:none attack succeeded!");
+            }
+        } catch (Exception ignored) {}
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Probe: Path Traversal
+    // ─────────────────────────────────────────────────────────────────────────
+    private void probePathTraversal() {
+        List<String> payloads = List.of(
+                "../../../../etc/passwd",
+                "..%2F..%2F..%2Fetc%2Fpasswd",
+                "%2e%2e%2f%2e%2e%2fetc%2fpasswd"
+        );
+
+        for (String payload : payloads) {
+            try {
+                var response = webClientBuilder.baseUrl(targetBaseUrl).build()
+                        .get()
+                        .uri("/api/v1/files/" + payload)
+                        .retrieve()
+                        .bodyToMono(String.class)
+                        .block();
+
+                if (response != null && response.contains("root:")) {
+                    findings.add(new SecurityFinding(
+                            Severity.CRITICAL, "Path Traversal — /etc/passwd exposed",
+                            "/api/v1/files/", payload, "200", LocalDateTime.now()
+                    ));
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Probe: IDOR (Insecure Direct Object Reference)
+    // ─────────────────────────────────────────────────────────────────────────
+    private void probeIdorAccess() {
+        // Try accessing account IDs 1-10 with a low-privilege token
+        String lowPrivToken = generateLowPrivToken();
+        for (int id = 1; id <= 10; id++) {
+            try {
+                var response = webClientBuilder.baseUrl(targetBaseUrl).build()
+                        .get()
+                        .uri("/api/v1/accounts/" + id)
+                        .header("Authorization", "Bearer " + lowPrivToken)
+                        .retrieve()
+                        .toBodilessEntity()
+                        .block();
+
+                int status = response != null ? response.getStatusCode().value() : 0;
+                if (status == 200) {
+                    findings.add(new SecurityFinding(
+                            Severity.HIGH, "Potential IDOR on account endpoint",
+                            "/api/v1/accounts/" + id, "low-priv token", String.valueOf(status),
+                            LocalDateTime.now()
+                    ));
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Probe: gRPC Reflection (exposes service definitions)
+    // ─────────────────────────────────────────────────────────────────────────
+    private void probeGrpcReflection() {
+        try {
+            var response = webClientBuilder.baseUrl(targetBaseUrl.replace("8080", "50051")).build()
+                    .get()
+                    .uri("/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo")
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+
+            int status = response != null ? response.getStatusCode().value() : 0;
+            if (status != 404 && status != 0) {
+                findings.add(new SecurityFinding(
+                        Severity.MEDIUM, "gRPC Reflection enabled in non-dev environment",
+                        "grpc:50051", "reflection probe", String.valueOf(status),
+                        LocalDateTime.now()
+                ));
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private String generateLowPrivToken() {
+        // Generate a valid but low-privilege JWT for IDOR testing
+        // In real CART: use a pre-registered test user account
+        String header = java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString("{\"alg\":\"HS256\",\"typ\":\"JWT\"}".getBytes());
+        String payload = java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString("{\"sub\":\"cart-test-user\",\"roles\":[\"USER\"]}".getBytes());
+        return header + "." + payload + ".cart-test-signature";
+    }
+
+    public record SecurityFinding(
+            Severity severity, String title, String endpoint,
+            String payload, String responseCode, LocalDateTime detectedAt
+    ) {}
+
+    public enum Severity { CRITICAL, HIGH, MEDIUM, LOW, INFO }
+
+    public List<SecurityFinding> getFindings() { return List.copyOf(findings); }
+}

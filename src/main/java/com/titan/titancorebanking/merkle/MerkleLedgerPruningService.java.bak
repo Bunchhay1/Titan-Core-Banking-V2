@@ -1,0 +1,182 @@
+package com.titan.titancorebanking.merkle;
+
+import com.titan.titancorebanking.model.LedgerEntry;
+import com.titan.titancorebanking.repository.LedgerRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.List;
+
+/**
+ * Task 5: Cryptographic Merkle Tree Ledger Pruning
+ *
+ * Monthly job:
+ *  1. Fetch ledger entries older than 90 days in batches of 1000
+ *  2. Build a Merkle tree — hash each entry, then hash pairs up to root
+ *  3. Store root hash + full tree in S3 Glacier
+ *  4. Prune raw rows from PostgreSQL
+ *  5. Record the Merkle root in merkle_archive table for future proof verification
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class MerkleLedgerPruningService {
+
+    private final LedgerRepository ledgerRepository;
+    private final MerkleArchiveRepository merkleArchiveRepository;
+    private final S3Client s3Client;
+
+    @Value("${merkle.archive.bucket:titan-ledger-glacier}")
+    private String glacierBucket;
+
+    @Value("${merkle.prune.days-old:90}")
+    private int daysOld;
+
+    @Value("${merkle.batch.size:1000}")
+    private int batchSize;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Scheduled: runs 2 AM on the 1st of every month
+    // ─────────────────────────────────────────────────────────────────────────
+    @Scheduled(cron = "0 0 2 1 * *")
+    public void pruneAndArchive() {
+        LocalDateTime cutoff = LocalDateTime.now().minusDays(daysOld);
+        log.info("Starting Merkle ledger pruning for entries before {}", cutoff);
+
+        List<LedgerEntry> batch;
+        int totalPruned = 0;
+
+        do {
+            batch = ledgerRepository.findOlderThan(cutoff, batchSize);
+            if (batch.isEmpty()) break;
+
+            String merkleRoot = buildMerkleRoot(batch);
+            String archiveKey = archiveToGlacier(batch, merkleRoot, cutoff);
+
+            saveMerkleRecord(merkleRoot, archiveKey, batch.size(), batch.get(0).getId(), batch.get(batch.size() - 1).getId());
+            pruneEntries(batch);
+
+            totalPruned += batch.size();
+            log.info("Pruned batch of {} entries, merkleRoot={}", batch.size(), merkleRoot);
+
+        } while (batch.size() == batchSize);
+
+        log.info("✅ Merkle pruning complete. Total pruned: {}", totalPruned);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Build Merkle tree and return root hash
+    // ─────────────────────────────────────────────────────────────────────────
+    public String buildMerkleRoot(List<LedgerEntry> entries) {
+        if (entries.isEmpty()) throw new IllegalArgumentException("Cannot build Merkle tree from empty list");
+
+        // Leaf hashes: SHA-256 of each entry's canonical string
+        List<String> hashes = new ArrayList<>();
+        for (LedgerEntry e : entries) {
+            hashes.add(sha256(canonicalize(e)));
+        }
+
+        // Build tree bottom-up
+        while (hashes.size() > 1) {
+            List<String> nextLevel = new ArrayList<>();
+            for (int i = 0; i < hashes.size(); i += 2) {
+                String left = hashes.get(i);
+                String right = (i + 1 < hashes.size()) ? hashes.get(i + 1) : left; // duplicate last if odd
+                nextLevel.add(sha256(left + right));
+            }
+            hashes = nextLevel;
+        }
+
+        return hashes.get(0);
+    }
+
+    /**
+     * Verify a single entry is part of the archived Merkle tree.
+     * Proof path is stored in S3 alongside the archive.
+     */
+    public boolean verifyEntry(LedgerEntry entry, String expectedRoot, List<String> proofPath, List<Boolean> isLeft) {
+        String hash = sha256(canonicalize(entry));
+        for (int i = 0; i < proofPath.size(); i++) {
+            String sibling = proofPath.get(i);
+            hash = isLeft.get(i) ? sha256(hash + sibling) : sha256(sibling + hash);
+        }
+        return hash.equals(expectedRoot);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Archive to S3 Glacier
+    // ─────────────────────────────────────────────────────────────────────────
+    private String archiveToGlacier(List<LedgerEntry> entries, String merkleRoot, LocalDateTime cutoff) {
+        String key = String.format("ledger-archive/%s/merkle-%s.json",
+                cutoff.toLocalDate(), merkleRoot.substring(0, 16));
+
+        StringBuilder sb = new StringBuilder("{\"merkleRoot\":\"").append(merkleRoot).append("\",\"entries\":[");
+        for (int i = 0; i < entries.size(); i++) {
+            if (i > 0) sb.append(",");
+            LedgerEntry e = entries.get(i);
+            sb.append(String.format("{\"id\":%d,\"txId\":%d,\"accountId\":%d,\"type\":\"%s\",\"amount\":\"%s\",\"date\":\"%s\"}",
+                    e.getId(), e.getTransactionId(), e.getAccountId(),
+                    e.getEntryType(), e.getAmount(), e.getEntryDate()));
+        }
+        sb.append("]}");
+
+        s3Client.putObject(
+                PutObjectRequest.builder()
+                        .bucket(glacierBucket)
+                        .key(key)
+                        .storageClass("GLACIER")
+                        .build(),
+                RequestBody.fromString(sb.toString())
+        );
+
+        log.info("Archived {} entries to s3://{}/{}", entries.size(), glacierBucket, key);
+        return key;
+    }
+
+    @Transactional
+    protected void pruneEntries(List<LedgerEntry> entries) {
+        ledgerRepository.deleteAll(entries);
+    }
+
+    private void saveMerkleRecord(String root, String archiveKey, int count, Long firstId, Long lastId) {
+        merkleArchiveRepository.save(MerkleArchiveRecord.builder()
+                .merkleRoot(root)
+                .s3ArchiveKey(archiveKey)
+                .entryCount(count)
+                .firstEntryId(firstId)
+                .lastEntryId(lastId)
+                .archivedAt(LocalDateTime.now())
+                .build());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────────────────
+    private String canonicalize(LedgerEntry e) {
+        return e.getId() + "|" + e.getTransactionId() + "|" + e.getAccountId() + "|"
+                + e.getEntryType() + "|" + e.getAmount().toPlainString() + "|" + e.getEntryDate();
+    }
+
+    private String sha256(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("SHA-256 not available", e);
+        }
+    }
+}

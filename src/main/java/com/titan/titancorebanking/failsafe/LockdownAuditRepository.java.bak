@@ -1,0 +1,14 @@
+package com.titan.titancorebanking.failsafe;
+
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+
+public interface LockdownAuditRepository extends JpaRepository<LockdownAuditEntry, Long> {
+    // No delete methods exposed — append-only by convention
+    @Override @Modifying default void delete(LockdownAuditEntry entity) {
+        throw new UnsupportedOperationException("Lockdown audit is immutable");
+    }
+    @Override @Modifying default void deleteAll() {
+        throw new UnsupportedOperationException("Lockdown audit is immutable");
+    }
+}

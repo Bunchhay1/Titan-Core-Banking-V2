@@ -1,0 +1,136 @@
+package com.titan.titancorebanking.htlc;
+
+import com.titan.titancorebanking.exception.InsufficientBalanceException;
+import com.titan.titancorebanking.model.Account;
+import com.titan.titancorebanking.repository.AccountRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.LocalDateTime;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Task 9: HTLC Escrow Service
+ *
+ * lock()   — debit sender, create HTLC with hashLock, 60-min expiry
+ * claim()  — receiver reveals preimage, SHA-256 verified, funds released
+ * expire() — scheduled job runs every minute, auto-refunds expired contracts
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class HtlcService {
+
+    private final HtlcRepository htlcRepository;
+    private final AccountRepository accountRepository;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // LOCK: Sender locks funds with a hash commitment
+    // ─────────────────────────────────────────────────────────────────────────
+    @Transactional
+    public HtlcContract lock(Long senderAccountId, Long receiverAccountId,
+                              BigDecimal amount, String hashLock, String memo) {
+        Account sender = accountRepository.findByIdWithLock(senderAccountId)
+                .orElseThrow(() -> new RuntimeException("Sender account not found"));
+
+        if (sender.getBalance().compareTo(amount) < 0) {
+            throw new InsufficientBalanceException("Insufficient balance for HTLC lock");
+        }
+
+        // Debit sender — funds held in escrow
+        sender.setBalance(sender.getBalance().subtract(amount));
+        accountRepository.save(sender);
+
+        HtlcContract contract = HtlcContract.builder()
+                .contractId(UUID.randomUUID().toString())
+                .senderAccountId(senderAccountId)
+                .receiverAccountId(receiverAccountId)
+                .amount(amount)
+                .currency(sender.getCurrency().name())
+                .hashLock(hashLock)
+                .status(HtlcContract.HtlcStatus.LOCKED)
+                .expiresAt(LocalDateTime.now().plusMinutes(60))
+                .memo(memo)
+                .build();
+
+        log.info("HTLC locked: contractId={}, amount={}, hashLock={}", contract.getContractId(), amount, hashLock);
+        return htlcRepository.save(contract);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CLAIM: Receiver reveals preimage to unlock funds
+    // ─────────────────────────────────────────────────────────────────────────
+    @Transactional
+    public HtlcContract claim(String contractId, String preimage) {
+        HtlcContract contract = htlcRepository.findById(contractId)
+                .orElseThrow(() -> new RuntimeException("HTLC contract not found: " + contractId));
+
+        if (contract.getStatus() != HtlcContract.HtlcStatus.LOCKED) {
+            throw new IllegalStateException("Contract is not in LOCKED state: " + contract.getStatus());
+        }
+
+        if (LocalDateTime.now().isAfter(contract.getExpiresAt())) {
+            throw new IllegalStateException("HTLC contract has expired");
+        }
+
+        // Verify: SHA-256(preimage) must equal hashLock
+        String computedHash = sha256(preimage);
+        if (!computedHash.equals(contract.getHashLock())) {
+            throw new SecurityException("Invalid preimage — hash does not match hashLock");
+        }
+
+        // Credit receiver
+        Account receiver = accountRepository.findByIdWithLock(contract.getReceiverAccountId())
+                .orElseThrow(() -> new RuntimeException("Receiver account not found"));
+        receiver.setBalance(receiver.getBalance().add(contract.getAmount()));
+        accountRepository.save(receiver);
+
+        contract.setPreimage(preimage);
+        contract.setStatus(HtlcContract.HtlcStatus.CLAIMED);
+        contract.setSettledAt(LocalDateTime.now());
+
+        log.info("HTLC claimed: contractId={}, receiver={}", contractId, contract.getReceiverAccountId());
+        return htlcRepository.save(contract);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // AUTO-EXPIRE: Runs every minute, refunds expired contracts
+    // ─────────────────────────────────────────────────────────────────────────
+    @Scheduled(fixedDelay = 60_000)
+    @Transactional
+    public void expireContracts() {
+        List<HtlcContract> expired = htlcRepository
+                .findByStatusAndExpiresAtBefore(HtlcContract.HtlcStatus.LOCKED, LocalDateTime.now());
+
+        for (HtlcContract contract : expired) {
+            // Refund sender
+            accountRepository.findByIdWithLock(contract.getSenderAccountId()).ifPresent(sender -> {
+                sender.setBalance(sender.getBalance().add(contract.getAmount()));
+                accountRepository.save(sender);
+            });
+
+            contract.setStatus(HtlcContract.HtlcStatus.REFUNDED);
+            contract.setSettledAt(LocalDateTime.now());
+            htlcRepository.save(contract);
+
+            log.info("HTLC expired & refunded: contractId={}, amount={}", contract.getContractId(), contract.getAmount());
+        }
+    }
+
+    private String sha256(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(digest.digest(input.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new RuntimeException("SHA-256 unavailable", e);
+        }
+    }
+}
