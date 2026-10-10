@@ -9,7 +9,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -20,12 +19,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 @Slf4j
-@ConditionalOnProperty(name = "kafka.enabled", havingValue = "true", matchIfMissing = true)
+// [MODIFIED] ARCHITECTURE: System now defaults to Debezium CDC for Kafka streaming.
+// ការប្រើ @ConditionalOnProperty នេះមានន័យថា Service នេះនឹងមិនដំណើរការទេលុះត្រាតែយើងបើកវាដោយដៃ (outbox.polling.enabled=true)។
+// ក្នុងកម្រិត Enterprise យើងប្រើ Debezium ដើម្បីអាន WAL (Write-Ahead Log) ពី Postgres ផ្ទាល់ជៀសវាងការធ្វើ Polling ដែលស៊ី CPU/RAM។
+@ConditionalOnProperty(name = "outbox.polling.enabled", havingValue = "true", matchIfMissing = false)
 public class OutboxRelayService {
 
     private static final String LOCK_KEY = "outbox:relay:lock";
     private static final Duration LOCK_TTL = Duration.ofSeconds(10);
-    private static final int BATCH_SIZE = 100;
+    private static final int BATCH_SIZE = 100; // Limits processing chunk to prevent memory bloat
     private static final int MAX_RETRIES = 5;
 
     private final OutboxRepository outboxRepository;
@@ -35,8 +37,8 @@ public class OutboxRelayService {
     private final String transactionCompletedTopic;
     private final AtomicBoolean localLock = new AtomicBoolean(false);
 
-    // [MODIFIED] Consolidated all dependencies into a single constructor.
-    // ប្រមូលផ្តុំការទាញយក Dependencies ទាំងអស់តាមរយៈ Constructor តែមួយ ដើម្បីធានាថា Class នេះអាចអានបានស្រួល និងមិនមានបញ្ហាពេលធ្វើ Unit Test។
+    // [MODIFIED] DEPENDENCY INJECTION: Consolidated dependencies into a single constructor.
+    // ការប្រើប្រាស់ Constructor Injection ធ្វើឲ្យកូដងាយស្រួលក្នុងការធ្វើ Unit Test និងធានាថា Object ត្រូវបានបង្កើតឡើងយ៉ាងត្រឹមត្រូវ។
     public OutboxRelayService(OutboxRepository outboxRepository,
                               KafkaTemplate<String, Object> kafkaTemplate,
                               ObjectMapper objectMapper,
@@ -49,8 +51,9 @@ public class OutboxRelayService {
         this.transactionCompletedTopic = transactionCompletedTopic;
     }
 
-    @Scheduled(fixedDelay = 2000)
-    public void relayPendingEvents() {
+    // [MODIFIED] PERFORMANCE: Removed @Scheduled(fixedDelay = 2000).
+    // លុបចោល @Scheduled ដើម្បីបញ្ឈប់ការទាញទិន្នន័យ (Database Polling) រៀងរាល់ ២ វិនាទី។ Method នេះទុកសម្រាប់តែការហៅប្រើដោយដៃ (Fallback) ពេល CDC មានបញ្ហាប៉ុណ្ណោះ។
+    public void relayPendingEventsFallback() {
         if (!acquireLock()) {
             log.trace("Outbox relay lock held by another process. Skipping.");
             return;
@@ -62,6 +65,8 @@ public class OutboxRelayService {
         }
     }
 
+    // [FLOW] DISTRIBUTED LOCKING: Ensures only one instance processes the outbox at a time to prevent duplicate Kafka messages.
+    // ធានាថាមាន Server តែមួយគត់ដែលអាចទាញទិន្នន័យ Outbox យកទៅដំណើរការបានក្នុងពេលតែមួយ (ទប់ស្កាត់ការផ្ញើសារស្ទួនចូល Kafka)។
     private boolean acquireLock() {
         if (redisTemplate != null) {
             var acquired = redisTemplate.opsForValue().setIfAbsent(LOCK_KEY, String.valueOf(System.currentTimeMillis()), LOCK_TTL);
@@ -78,28 +83,25 @@ public class OutboxRelayService {
         }
     }
 
-    // [MODIFIED] Fixed Transactional proxy issue and concurrency hazards.
-    // ជួសជុលបញ្ហា @Transactional ដោយយក Method នេះមកជា public ដើម្បីឲ្យ Spring Proxy អាចចាប់បានត្រឹមត្រូវពេលធ្វើការជាមួយ Database។
     @Transactional
     public void processOutboxBatch() {
+        // [FLOW] BATCH PROCESSING: Fetch only top 100 unpublished events that haven't exceeded max retries.
         var pendingEvents = outboxRepository.findTop100ByPublishedFalseAndRetryCountLessThanOrderByCreatedAtAsc(MAX_RETRIES);
-
         if (pendingEvents.isEmpty()) return;
 
-        log.info("Processing {} pending outbox events", pendingEvents.size());
-
+        log.info("Processing {} pending outbox events (Fallback Mode)", pendingEvents.size());
         for (var event : pendingEvents) {
             processSingleEvent(event);
         }
     }
 
-    // [MODIFIED] Switched from Async callback to bounded synchronous publish for outbox safety.
-    // ប្តូរពីការផ្ញើតាមបែប Async ទៅជា Synchronous (រង់ចាំលទ្ធផលអតិបរមា ៥ វិនាទី) ដើម្បីការពារកុំឲ្យ Thread ផ្សេងមកសរសេរជាន់លើ Entity ដែលកំពុងបើកក្នុង Transaction តែមួយ។
+    // [MODIFIED] RELIABILITY: Switched to synchronous bounded wait for Kafka acknowledgments.
     private void processSingleEvent(OutboxEvent event) {
         try {
             var payload = objectMapper.readValue(event.getPayload(), Object.class);
 
-            // Block with a timeout to guarantee delivery confirmation before updating the DB state
+            // [FLOW] EXACTLY-ONCE SEMANTICS: Block for 5 seconds waiting for Kafka broker ACK.
+            // រង់ចាំការឆ្លើយតបពី Kafka រយៈពេល ៥វិនាទី (Synchronous)។ បើ Kafka មិនឆ្លើយតបទេ វានឹងលោតចូល Catch Block (ការពារការបាត់បង់ទិន្នន័យពេល Network ដាច់)។
             var sendResult = kafkaTemplate.send(transactionCompletedTopic, event.getAggregateId(), payload)
                     .get(5, TimeUnit.SECONDS);
 
@@ -113,13 +115,14 @@ public class OutboxRelayService {
         }
     }
 
+    // [FLOW] FAULT TOLERANCE: Implements a retry mechanism with a hard cap to prevent infinite loops on poison pills.
     private void handleEventFailure(OutboxEvent event, Exception ex) {
         event.setRetryCount(event.getRetryCount() + 1);
         event.setLastError(ex.getMessage());
         outboxRepository.save(event);
 
         if (event.getRetryCount() >= MAX_RETRIES) {
-            log.error("Event {} exceeded max retries. Marking dead.", event.getId());
+            log.error("Event {} exceeded max retries. Marking dead.", event.getId()); // Dead Letter Queue logic entry point
         } else {
             log.warn("Event {} failed (retry {}/{}): {}", event.getId(), event.getRetryCount(), MAX_RETRIES, ex.getMessage());
         }

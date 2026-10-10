@@ -1,0 +1,132 @@
+# =============================================================================
+# Titan High-Frequency Core Banking - Production Docker Compose (Enterprise HA)
+# =============================================================================
+services:
+  # 1. PostgreSQL Database
+  postgres:
+    build:
+      context: ./init-db
+      dockerfile: Dockerfile.postgres
+    platform: linux/arm64
+    container_name: titan-postgres
+    environment:
+      POSTGRES_USER: ${DB_PRODUCTION_USER:-postgres}
+      # [MODIFIED] SECURITY: Removed hardcoded password. Must be injected via CI/CD or Vault at runtime.
+      # ការពារសុវត្ថិភាពដោយលុបលេខសម្ងាត់ពីក្នុងកូដ ហើយតម្រូវឲ្យបញ្ជូលពីក្រៅ (Environment Variable) ពេល Deploy។
+      POSTGRES_PASSWORD: ${DB_PRODUCTION_PASSWORD:?Database password must be provided!}
+      POSTGRES_DB: ${DB_PRODUCTION_NAME:-titandb}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db/01-create-databases.sql:/docker-entrypoint-initdb.d/01-create-databases.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_PRODUCTION_USER:-postgres} -d ${DB_PRODUCTION_NAME:-titandb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: titan-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 2. Kafka KRaft Cluster (Broker 1)
+  kafka-1:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: titan-kafka-1
+    environment:
+      # [MODIFIED] HA INFRASTRUCTURE: Changed from a single node to a 3-node Quorum.
+      # រៀបចំ Kafka ឲ្យមាន ៣ Nodes ដើម្បីបង្កើត Quorum ធានាថាប្រព័ន្ធមិនដាច់ពេលមានបញ្ហា។
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-1:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg=="
+    restart: unless-stopped
+
+  # 3. Kafka KRaft Cluster (Broker 2)
+  kafka-2:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: titan-kafka-2
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-2:29092,PLAINTEXT_HOST://localhost:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg=="
+    restart: unless-stopped
+
+  # 4. Kafka KRaft Cluster (Broker 3)
+  kafka-3:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: titan-kafka-3
+    environment:
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9094"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-3:29092,PLAINTEXT_HOST://localhost:9094"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LOG_DIRS: "/tmp/kraft-combined-logs"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg=="
+    restart: unless-stopped
+
+  # 5. Kafka Topic Initializer (Enterprise Configuration)
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: titan-kafka-init
+    depends_on:
+      - kafka-1
+      - kafka-2
+      - kafka-3
+    entrypoint: [ "/bin/sh", "-c" ]
+    # [MODIFIED] DATA INTEGRITY: Enforced replication-factor=3 and min.insync.replicas=2.
+    # កំណត់ឲ្យទិន្នន័យនីមួយៗត្រូវចម្លងទៅ 3 Brokers ហើយទាល់តែមាន 2 Brokers ទទួលស្គាល់ទើបចាត់ទុកថាជោគជ័យ។
+    command: |
+      "
+      echo -e 'Creating Enterprise Kafka topics...'
+      kafka-topics --bootstrap-server kafka-1:29092 --create --if-not-exists \
+        --topic banking.transactions.completed --partitions 3 \
+        --replication-factor 3 --config min.insync.replicas=2
+      "
+    restart: "no"
+
+  # 6. Core Banking Engine
+  titan-core-banking:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: titan-core-banking
+    ports:
+      - "8080:8080"
+    environment:
+      # [MODIFIED] ENV CONFIG: Referencing dynamic environment variables injected by orchestrator.
+      # តភ្ជាប់ Spring Boot ទៅកាន់ Database និង Kafka Cluster ដោយប្រើប្រាស់ Configuration ដែលសុវត្ថិភាព។
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${DB_PRODUCTION_NAME:-titandb}
+      SPRING_DATASOURCE_USERNAME: ${DB_PRODUCTION_USER:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PRODUCTION_PASSWORD:?Database password must be provided!}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      SPRING_PROFILES_ACTIVE: docker
+      JAVA_OPTS: "-Xmx1024m -Xms512m --enable-preview"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
