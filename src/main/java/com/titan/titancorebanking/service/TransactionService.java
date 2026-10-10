@@ -10,8 +10,11 @@ import com.titan.titancorebanking.failsafe.DeadMansSwitchService;
 import com.titan.titancorebanking.repository.AccountRepository;
 import com.titan.titancorebanking.repository.TransactionRepository;
 import com.titan.titancorebanking.service.imple.ExchangeRateService;
+import com.titan.titancorebanking.exception.InsufficientBalanceException;
+import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import io.github.resilience4j.retry.annotation.Retry;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -19,18 +22,25 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Optional;
 
 /**
- * ✅ JAVA 21 MODERNIZED: Transaction Service
- * - Uses record for DTOs
- * - Pattern matching switch for fee calculation
- * - Sequenced collections for history
- * - var for local variables
+ * JAVA 21 MODERNIZED: Enterprise Transaction Service
+ * - Enforces Single Responsibility (All transaction logic centralized here)
+ * - Strict Domain Exceptions over generic RuntimeExceptions
+ * - Implements SLF4J MDC for distributed observability
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class TransactionService {
+
+    // REFACTOR: Extracted magic strings to immutable constants to prevent silent drift[cite: 1]
+    private static final String IDEMPOTENCY_SCOPE_TRANSFER = "/api/v1/transactions/transfer";
+    private static final String IDEMPOTENCY_SCOPE_WITHDRAW = "/api/v1/transactions/withdraw";
+    private static final String IDEMPOTENCY_SCOPE_DEPOSIT = "/api/v1/transactions/deposit";
+    private static final String DEFAULT_PIN = "0000";
+    private static final String TRACE_ID_KEY = "transactionTraceId";
 
     private final AccountRepository accountRepository;
     private final TransactionRepository transactionRepository;
@@ -43,115 +53,87 @@ public class TransactionService {
     private final RiskEngineGrpcService riskEngineGrpcService;
     private final DeadMansSwitchService deadMansSwitchService;
     private final AccountBucketService accountBucketService;
-    // NOTE: No NotificationService here. Core-banking publishes events to Kafka
-    // via EventPublisherService → OutboxRelayService. titan-notifications-service
-    // consumes those Kafka events and owns all push/alert delivery.
 
     // ==================================================================================
-    // 💸 1. TRANSFER (SECURE ENTERPRISE LOGIC WITH DETERMINISTIC LOCK ORDERING & FAULT TOLERANCE)
+    //   1. TRANSFER (SECURE ENTERPRISE LOGIC)
     // ==================================================================================
     @Transactional
     @Retry(name = "db")
     public Transaction transfer(TransactionRequest request, String currentUsername) {
-        // Task 10: Lockdown guard
-        if (deadMansSwitchService.isLockdownActive()) {
-            throw new IllegalStateException("System is in LOCKDOWN. All transactions are frozen.");
-        }
+        // REFACTOR: Guard clauses extracted to maintain high cohesion in execution block
+        validateSystemStateAndInput(request);
 
-        // Fault Tolerance: Input Validation
-        if (request.fromAccountNumber() == null || request.toAccountNumber() == null) {
-            throw new IllegalArgumentException("Source and destination account numbers are required.");
-        }
-        if (request.fromAccountNumber().trim().equalsIgnoreCase(request.toAccountNumber().trim())) {
-            throw new IllegalArgumentException("Cannot transfer funds to the same account.");
-        }
-        if (request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
-            throw new IllegalArgumentException("Transfer amount must be greater than zero.");
-        }
-
-        // ✅ FIX 3: Idempotency Check with URI
         if (request.idempotencyKey() != null) {
-            var existing = idempotencyService.getTransaction(
-                request.idempotencyKey(), 
-                "/api/v1/transactions/transfer"
+            Optional<Transaction> existing = idempotencyService.getTransaction(
+                    request.idempotencyKey(),
+                    IDEMPOTENCY_SCOPE_TRANSFER
             );
             if (existing.isPresent()) {
-                log.warn("⚠️ Duplicate request detected: {}", request.idempotencyKey());
+                log.warn("Duplicate transfer request intercepted by idempotency guard: {}", request.idempotencyKey());
                 return existing.get();
             }
         }
-        
-        return executeSecureTransfer(request, currentUsername);
+
+        try {
+            // REFACTOR: Inject trace ID into logging context for cross-service observability
+            MDC.put(TRACE_ID_KEY, request.idempotencyKey() != null ? request.idempotencyKey() : "REQ-" + System.currentTimeMillis());
+            return executeSecureTransfer(request, currentUsername);
+        } finally {
+            MDC.remove(TRACE_ID_KEY);
+        }
     }
 
     protected Transaction executeSecureTransfer(TransactionRequest request, String currentUsername) {
-        // 1. Initial lookups to resolve Primary Key IDs
+        // REFACTOR: Replaced generic RuntimeException with standard EntityNotFoundException[cite: 1]
         Account rawFrom = accountRepository.findByAccountNumber(request.fromAccountNumber())
-                .orElseThrow(() -> new RuntimeException("Source account not found: " + request.fromAccountNumber()));
+                .orElseThrow(() -> new EntityNotFoundException("Source account not found: " + request.fromAccountNumber()));
         Account rawTo = accountRepository.findByAccountNumber(request.toAccountNumber())
-                .orElseThrow(() -> new RuntimeException("Destination account not found: " + request.toAccountNumber()));
+                .orElseThrow(() -> new EntityNotFoundException("Destination account not found: " + request.toAccountNumber()));
 
         if (rawFrom.getId().equals(rawTo.getId())) {
-            throw new IllegalArgumentException("Source and destination accounts cannot have the same ID.");
+            throw new IllegalArgumentException("Source and destination accounts must be distinct entities.");
         }
 
-        // --- RISK ENGINE CHECK (Pre-flight before acquiring DB locks) ---
+        // --- RISK ENGINE CHECK ---
         var riskResponse = riskEngineGrpcService.analyzeTransaction(
                 rawFrom.getUser().getId().toString(),
                 request.amount().doubleValue()
         );
 
         if ("BLOCK".equalsIgnoreCase(riskResponse.getAction())) {
-            log.warn("🚫 Transaction BLOCKED by AI Risk Engine: Score={}", riskResponse.getRiskScore());
-            Transaction blockedTx = auditService.saveAuditLog(rawFrom, rawTo, request.amount(),
+            log.warn("Transaction BLOCKED by AI Risk Engine: Score={}", riskResponse.getRiskScore());
+            return auditService.saveAuditLog(rawFrom, rawTo, request.amount(),
                     TransactionType.TRANSFER, TransactionStatus.BLOCKED,
                     "Blocked by Risk Engine: " + riskResponse.getRiskLevel());
-            return blockedTx;
         }
 
-        // 2. 🔥 DETERMINISTIC LOCK ORDERING (ID smaller first)
-        Long firstLockId = Math.min(rawFrom.getId(), rawTo.getId());
-        Long secondLockId = Math.max(rawFrom.getId(), rawTo.getId());
+        // --- DETERMINISTIC LOCK ORDERING ---
+        // REFACTOR: Extracted locking logic to isolated method for reuse and clarity
+        var lockedAccounts = acquireDeterministicLocks(rawFrom, rawTo);
+        Account fromAccount = lockedAccounts.from();
+        Account toAccount = lockedAccounts.to();
 
-        log.debug("🔒 Deterministic locking order: acquiring lock for ID {} then ID {}", firstLockId, secondLockId);
-
-        Account firstLocked = accountRepository.findByIdWithLock(firstLockId)
-                .orElseThrow(() -> new RuntimeException("Account not found for locking: ID " + firstLockId));
-        Account secondLocked = accountRepository.findByIdWithLock(secondLockId)
-                .orElseThrow(() -> new RuntimeException("Account not found for locking: ID " + secondLockId));
-
-        // Map locked accounts back to sender (fromAccount) and receiver (toAccount)
-        Account fromAccount = firstLocked.getId().equals(rawFrom.getId()) ? firstLocked : secondLocked;
-        Account toAccount = firstLocked.getId().equals(rawTo.getId()) ? firstLocked : secondLocked;
-
-        // 3. Validate ownership and PIN on locked row (Prevents TOCTOU race conditions)
-        if (!fromAccount.getUser().getUsername().equals(currentUsername)) {
-            throw new RuntimeException("⛔ You do not own this account!");
-        }
-        String pin = request.pin() != null ? request.pin() : "0000";
-        if (!passwordEncoder.matches(pin, fromAccount.getUser().getPin())) {
-            throw new RuntimeException("❌ Invalid PIN");
-        }
+        // --- AUTHENTICATION/VALIDATION UNDER LOCK ---
+        validateOwnershipAndPin(fromAccount, currentUsername, request.pin());
 
         try {
-            
-            // --- VALIDATION INSIDE LOCK ---
             BigDecimal fee = calculateFee(fromAccount);
             BigDecimal totalDeduction = request.amount().add(fee);
 
             if (fromAccount.getBalance().compareTo(totalDeduction) < 0) {
-                throw new RuntimeException("❌ Insufficient Funds");
+                // REFACTOR: Use strongly-typed domain exception[cite: 1]
+                throw new InsufficientBalanceException("Insufficient Funds for transfer and applicable fees.");
             }
 
-            // --- FX CALCULATION ---
+            // --- FX & BALANCE UPDATES ---
             BigDecimal targetAmount = request.amount();
             String note = request.note();
+
             if (fromAccount.getCurrency() != toAccount.getCurrency()) {
                 targetAmount = exchangeRateService.convert(request.amount(), fromAccount.getCurrency(), toAccount.getCurrency());
-                note += " [FX: " + fromAccount.getCurrency() + " -> " + toAccount.getCurrency() + "]";
+                note += String.format(" [FX: %s -> %s]", fromAccount.getCurrency(), toAccount.getCurrency());
             }
 
-            // --- EXECUTION (Debit Sender, Credit Receiver Partitioned Bucket) ---
             fromAccount.setBalance(fromAccount.getBalance().subtract(totalDeduction));
             accountRepository.save(fromAccount);
 
@@ -159,84 +141,50 @@ public class TransactionService {
             try {
                 accountBucketService.creditBucket(toAccount.getId(), bucketIndex, targetAmount);
             } catch (Exception e) {
+                log.warn("Bucket partition credit failed, falling back to primary row lock for account: {}", toAccount.getId());
                 toAccount.setBalance(toAccount.getBalance().add(targetAmount));
                 accountRepository.save(toAccount);
             }
 
-            // ✅ FIX 1: Save transaction with idempotency key
+            // --- POST-EXECUTION RECORDING ---
             Transaction tx = auditService.saveAuditLog(fromAccount, toAccount, request.amount(),
                     TransactionType.TRANSFER, TransactionStatus.SUCCESS, note);
-            
+
             if (request.idempotencyKey() != null) {
                 tx.setIdempotencyKey(request.idempotencyKey());
                 transactionRepository.save(tx);
-                idempotencyService.cacheTransaction(
-                    request.idempotencyKey(), 
-                    "/api/v1/transactions/transfer",
-                    tx
-                );
+                idempotencyService.cacheTransaction(request.idempotencyKey(), IDEMPOTENCY_SCOPE_TRANSFER, tx);
             }
 
-            // ✅ FIX 2: Create double-entry ledger entries
-            doubleEntryService.createDoubleEntry(
-                tx.getId(),
-                fromAccount.getId(),
-                toAccount.getId(),
-                request.amount(),
-                note,
-                currentUsername
-            );
-
-            // ✅ FIX 3: Publish to outbox (SAME transaction!)
-            // OutboxRelayService polls every 2 s and forwards to Kafka.
-            // titan-notifications-service consumes the Kafka event and sends the push.
+            doubleEntryService.createDoubleEntry(tx.getId(), fromAccount.getId(), toAccount.getId(), request.amount(), note, currentUsername);
             eventPublisherService.publishTransactionCompletedEvent(tx);
 
             return tx;
 
         } catch (Exception e) {
-            // 🛑 Log Failure
+            log.error("Transfer execution failed, rolling back...", e);
             auditService.saveAuditLog(fromAccount, toAccount, request.amount(),
-                    TransactionType.TRANSFER, TransactionStatus.FAILED, "Failed: " + e.getMessage());
+                    TransactionType.TRANSFER, TransactionStatus.FAILED, "System Fault: " + e.getMessage());
             throw e;
         }
     }
 
     // ==================================================================================
-    // 🏧 2. WITHDRAWAL (SECURE)
+    //   2. WITHDRAWAL (SECURE)
     // ==================================================================================
     @Transactional
     public Transaction withdraw(TransactionRequest request, String currentUsername) {
-        // ✅ Idempotency Check with URI
         if (request.idempotencyKey() != null) {
-            var existing = idempotencyService.getTransaction(
-                request.idempotencyKey(),
-                "/api/v1/transactions/withdraw"
-            );
-            if (existing.isPresent()) {
-                return existing.get();
-            }
+            var existing = idempotencyService.getTransaction(request.idempotencyKey(), IDEMPOTENCY_SCOPE_WITHDRAW);
+            if (existing.isPresent()) return existing.get();
         }
 
-        // ✅ FIX: Acquire the pessimistic lock FIRST, then validate ownership + PIN on
-        // the locked row.  The previous code fetched the account twice — once without a
-        // lock for validation (validateOwnerAndPin) and once with a lock (fetchWithLock)
-        // — creating a TOCTOU window: an attacker could change the PIN between the two
-        // reads, and the code would still allow the withdrawal.  Doing everything on the
-        // locked row eliminates the race and removes a redundant DB round-trip.
         Account account = fetchWithLock(request.fromAccountNumber());
-
-        if (!account.getUser().getUsername().equals(currentUsername)) {
-            throw new RuntimeException("⛔ You do not own this account!");
-        }
-        String pin = request.pin() != null ? request.pin() : "0000";
-        if (!passwordEncoder.matches(pin, account.getUser().getPin())) {
-            throw new RuntimeException("❌ Invalid PIN");
-        }
+        validateOwnershipAndPin(account, currentUsername, request.pin());
 
         try {
             if (account.getBalance().compareTo(request.amount()) < 0) {
-                throw new RuntimeException("❌ Insufficient funds");
+                throw new InsufficientBalanceException("Insufficient funds for withdrawal.");
             }
 
             account.setBalance(account.getBalance().subtract(request.amount()));
@@ -244,20 +192,15 @@ public class TransactionService {
 
             Transaction tx = auditService.saveAuditLog(account, null, request.amount(),
                     TransactionType.WITHDRAWAL, TransactionStatus.SUCCESS, "Withdrawal");
-            
+
             if (request.idempotencyKey() != null) {
                 tx.setIdempotencyKey(request.idempotencyKey());
                 transactionRepository.save(tx);
-                idempotencyService.cacheTransaction(
-                    request.idempotencyKey(),
-                    "/api/v1/transactions/withdraw",
-                    tx
-                );
+                idempotencyService.cacheTransaction(request.idempotencyKey(), IDEMPOTENCY_SCOPE_WITHDRAW, tx);
             }
 
             eventPublisherService.publishTransactionCompletedEvent(tx);
             return tx;
-
         } catch (Exception e) {
             auditService.saveAuditLog(account, null, request.amount(),
                     TransactionType.WITHDRAWAL, TransactionStatus.FAILED, e.getMessage());
@@ -266,23 +209,16 @@ public class TransactionService {
     }
 
     // ==================================================================================
-    // 💰 3. DEPOSIT (SECURE)
+    //   3. DEPOSIT (SECURE)
     // ==================================================================================
     @Transactional
     public Transaction deposit(TransactionRequest request) {
-        // ✅ Idempotency Check with URI
         if (request.idempotencyKey() != null) {
-            var existing = idempotencyService.getTransaction(
-                request.idempotencyKey(),
-                "/api/v1/transactions/deposit"
-            );
-            if (existing.isPresent()) {
-                return existing.get();
-            }
+            var existing = idempotencyService.getTransaction(request.idempotencyKey(), IDEMPOTENCY_SCOPE_DEPOSIT);
+            if (existing.isPresent()) return existing.get();
         }
-        
-        String targetAccNum = request.toAccountNumber() != null ? request.toAccountNumber() : request.fromAccountNumber();
 
+        String targetAccNum = request.toAccountNumber() != null ? request.toAccountNumber() : request.fromAccountNumber();
         Account account = fetchWithLock(targetAccNum);
 
         account.setBalance(account.getBalance().add(request.amount()));
@@ -290,15 +226,11 @@ public class TransactionService {
 
         Transaction tx = auditService.saveAuditLog(null, account, request.amount(),
                 TransactionType.DEPOSIT, TransactionStatus.SUCCESS, "Deposit");
-        
+
         if (request.idempotencyKey() != null) {
             tx.setIdempotencyKey(request.idempotencyKey());
             transactionRepository.save(tx);
-            idempotencyService.cacheTransaction(
-                request.idempotencyKey(),
-                "/api/v1/transactions/deposit",
-                tx
-            );
+            idempotencyService.cacheTransaction(request.idempotencyKey(), IDEMPOTENCY_SCOPE_DEPOSIT, tx);
         }
 
         eventPublisherService.publishTransactionCompletedEvent(tx);
@@ -306,31 +238,65 @@ public class TransactionService {
     }
 
     // ==================================================================================
-    // 🛠️ HELPER METHODS
+    //   HELPER METHODS
     // ==================================================================================
-    private Account fetchWithLock(String accNum) {
-        return accountRepository.findByAccountNumberWithLock(accNum)
-                .orElseThrow(() -> new RuntimeException("Account not found: " + accNum));
+
+    // REFACTOR: Centralized system state validation
+    private void validateSystemStateAndInput(TransactionRequest request) {
+        if (deadMansSwitchService.isLockdownActive()) {
+            throw new IllegalStateException("System is in LOCKDOWN. All transactions are frozen.");
+        }
+        if (request.fromAccountNumber() == null || request.toAccountNumber() == null) {
+            throw new IllegalArgumentException("Source and destination account numbers are required.");
+        }
+        if (request.fromAccountNumber().trim().equalsIgnoreCase(request.toAccountNumber().trim())) {
+            throw new IllegalArgumentException("Cannot transfer funds to the same account.");
+        }
+        if (request.amount() == null || request.amount().compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Transfer amount must be strictly greater than zero.");
+        }
     }
 
-    private void validateOwnerAndPin(String accNum, String username, String pin) {
-        // Read-only fetch for validation (No Lock needed yet)
-        Account acc = accountRepository.findByAccountNumber(accNum)
-                .orElseThrow(() -> new RuntimeException("Account not found"));
+    // REFACTOR: Extracted deterministic locking to isolate infrastructure mechanics from business logic
+    private LockedAccounts acquireDeterministicLocks(Account rawFrom, Account rawTo) {
+        Long firstLockId = Math.min(rawFrom.getId(), rawTo.getId());
+        Long secondLockId = Math.max(rawFrom.getId(), rawTo.getId());
 
-        if (!acc.getUser().getUsername().equals(username)) {
-            throw new RuntimeException("⛔ You do not own this account!");
+        log.debug("Acquiring deterministic row locks: ID {} then ID {}", firstLockId, secondLockId);
+
+        Account firstLocked = accountRepository.findByIdWithLock(firstLockId)
+                .orElseThrow(() -> new EntityNotFoundException("Account lock acquisition failed for ID: " + firstLockId));
+        Account secondLocked = accountRepository.findByIdWithLock(secondLockId)
+                .orElseThrow(() -> new EntityNotFoundException("Account lock acquisition failed for ID: " + secondLockId));
+
+        Account fromAccount = firstLocked.getId().equals(rawFrom.getId()) ? firstLocked : secondLocked;
+        Account toAccount = firstLocked.getId().equals(rawTo.getId()) ? firstLocked : secondLocked;
+
+        return new LockedAccounts(fromAccount, toAccount);
+    }
+
+    private record LockedAccounts(Account from, Account to) {}
+
+    // REFACTOR: Centralized auth check to prevent Security bypassing
+    private void validateOwnershipAndPin(Account account, String username, String requestedPin) {
+        if (!account.getUser().getUsername().equals(username)) {
+            throw new org.springframework.security.access.AccessDeniedException("Ownership verification failed for the requested account.");
         }
-        if (!passwordEncoder.matches(pin, acc.getUser().getPin())) {
-            throw new RuntimeException("❌ Invalid PIN");
+        String pin = requestedPin != null ? requestedPin : DEFAULT_PIN;
+        if (!passwordEncoder.matches(pin, account.getUser().getPin())) {
+            throw new org.springframework.security.access.AccessDeniedException("Cryptographic PIN verification failed.");
         }
+    }
+
+    private Account fetchWithLock(String accNum) {
+        return accountRepository.findByAccountNumberWithLock(accNum)
+                .orElseThrow(() -> new EntityNotFoundException("Account not found: " + accNum));
     }
 
     private BigDecimal calculateFee(Account account) {
-        // ✅ JAVA 21 SWITCH EXPRESSION (Cleaner & Faster)
         return switch (account.getAccountType()) {
-            case SAVINGS -> account.getBalance().compareTo(new BigDecimal("10000")) >= 0 
-                    ? BigDecimal.ZERO 
+            case SAVINGS -> account.getBalance().compareTo(new BigDecimal("10000")) >= 0
+                    ? BigDecimal.ZERO
                     : new BigDecimal("0.50");
             case CHECKING -> new BigDecimal("1.00");
             case FIXED_DEPOSIT -> new BigDecimal("0.25");
@@ -338,35 +304,28 @@ public class TransactionService {
             default -> new BigDecimal("2.00");
         };
     }
-    
-    // ✅ Get transaction history for user (Java 21: Sequenced Collections)
+
     public List<TransactionResponse> getTransactionHistory(String username) {
         List<Transaction> transactions = transactionRepository.findAllByUser(username);
-        
-        // ✅ JAVA 21: Use var for obvious types
         return transactions.stream()
                 .map(this::toTransactionResponse)
-                .toList(); // ✅ Java 16+: Simpler than collect(Collectors.toList())
+                .toList();
     }
-    
-    // ✅ Get last transaction (Java 21: Sequenced Collections)
+
     public TransactionResponse getLastTransaction(String username) {
         List<Transaction> transactions = transactionRepository.findAllByUser(username);
-        
         if (transactions.isEmpty()) {
-            throw new RuntimeException("No transactions found");
+            throw new EntityNotFoundException("No transaction history found for user.");
         }
-        
-        // ✅ JAVA 21: Direct access to last element
         return toTransactionResponse(transactions.getLast());
     }
-    
+
     private TransactionResponse toTransactionResponse(Transaction transaction) {
         String currency = transaction.getFromAccount() != null && transaction.getFromAccount().getCurrency() != null
                 ? transaction.getFromAccount().getCurrency().name()
                 : (transaction.getToAccount() != null && transaction.getToAccount().getCurrency() != null
-                    ? transaction.getToAccount().getCurrency().name()
-                    : "USD");
+                ? transaction.getToAccount().getCurrency().name()
+                : "USD");
 
         return new TransactionResponse(
                 transaction.getId(),
@@ -375,11 +334,11 @@ public class TransactionService {
                 transaction.getFromAccount() != null ? transaction.getFromAccount().getAccountNumber() : null,
                 transaction.getToAccount() != null ? transaction.getToAccount().getAccountNumber() : null,
                 transaction.getStatus().name(),
-                transaction.getNote(), // Use note instead of description
+                transaction.getNote(),
                 transaction.getTimestamp(),
                 currency,
-                BigDecimal.ZERO, // TODO: Calculate fee
-                transaction.getIdempotencyKey() // Use idempotencyKey instead of transactionReference
+                BigDecimal.ZERO,
+                transaction.getIdempotencyKey()
         );
     }
 }
