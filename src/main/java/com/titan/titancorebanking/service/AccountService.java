@@ -1,30 +1,33 @@
 package com.titan.titancorebanking.service;
 
 import com.titan.titancorebanking.dto.request.AccountRequest;
-import com.titan.titancorebanking.dto.response.AccountResponse;
 import com.titan.titancorebanking.model.Account;
 import com.titan.titancorebanking.model.User;
-import com.titan.titancorebanking.exception.AccountLimitExceededException;
-import com.titan.titancorebanking.exception.ResourceNotFoundException;
-import com.titan.titancorebanking.event.AccountCreatedEvent;
+import com.titan.titancorebanking.enums.AccountType;
+import com.titan.titancorebanking.enums.AccountStatus;
+import com.titan.titancorebanking.enums.Currency;
 import com.titan.titancorebanking.repository.AccountRepository;
 import com.titan.titancorebanking.repository.UserRepository;
+import com.titan.titancorebanking.utils.AccountNumberUtils;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
-import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.util.Assert;
 import io.github.resilience4j.retry.annotation.Retry;
-import org.springframework.dao.DataAccessException;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.List;
 
+/**
+ * Strictly handles Account Lifecycle Management.
+ * SRP Enforced: Transaction and Transfer logic has been extracted to TransactionOrchestratorService.
+ */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -33,110 +36,106 @@ public class AccountService {
     private final AccountRepository accountRepository;
     private final UserRepository userRepository;
     private final AccountBucketService accountBucketService;
-    private final AccountGeneratorService accountGeneratorService;
-    private final ApplicationEventPublisher eventPublisher;
+
+    // @Lazy breaks the circular dependency:
+    // AccountService → QrPaymentService → AccountRepository (← same bean AccountService uses)
+    @Autowired
+    @Lazy
+    private QrPaymentService qrPaymentService;
 
     private static final int MAX_ACCOUNTS = 10;
 
     @Transactional
     @CacheEvict(value = "user_accounts", key = "#username")
     @Retry(name = "db")
-    public AccountResponse createAccount(AccountRequest request, String username) {
-        // Defensive Programming: Fail Fast
-        Assert.hasText(username, "Username must not be blank");
-        Assert.notNull(request, "AccountRequest must not be null");
-
+    public Account createAccount(AccountRequest request, String username) {
         User user = userRepository.findByUsername(username)
-                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + username));
+                .orElseThrow(() -> new UsernameNotFoundException("User not found"));
 
         if (accountRepository.countByUser(user) >= MAX_ACCOUNTS) {
-            log.warn("Account creation blocked. User {} reached max limit.", username);
-            throw new AccountLimitExceededException("Limit Reached: Maximum of " + MAX_ACCOUNTS + " accounts allowed.");
+            throw new RuntimeException("⛔ Limit Reached: You can only create " + MAX_ACCOUNTS + " accounts.");
         }
 
-        // Generate and persist account in a separate transaction boundary if needed
-        Account account = accountGeneratorService.generateAndPersistAccount(
-                user, request.getAccountType(), request.getCurrency()
-        );
+        AccountType type = AccountType.SAVINGS;
+        if (request.getAccountType() != null) {
+            try {
+                type = AccountType.valueOf(request.getAccountType().toUpperCase());
+            } catch (IllegalArgumentException e) {
+                log.warn("Invalid AccountType: {}. Defaulting to SAVINGS.", request.getAccountType());
+            }
+        }
 
+        Currency currency = Currency.USD;
+        if (request.getCurrency() != null) {
+            try {
+                currency = Currency.valueOf(request.getCurrency().toUpperCase());
+            } catch (Exception e) {
+                log.warn("Invalid Currency: {}. Defaulting to USD.", request.getCurrency());
+            }
+        }
+
+        String newAccountNumber;
+        int attempts = 0;
+        do {
+            newAccountNumber = AccountNumberUtils.generateAccountNumber();
+            attempts++;
+            if (attempts > 5) throw new RuntimeException("🔥 System Busy: Could not generate unique account number.");
+        } while (accountRepository.existsByAccountNumber(newAccountNumber));
+
+        Account account = Account.builder()
+                .accountNumber(newAccountNumber)
+                .accountType(type)
+                .balance(request.getInitialDeposit() != null ? request.getInitialDeposit() : BigDecimal.ZERO)
+                .user(user)
+                .createdAt(LocalDateTime.now())
+                .status(AccountStatus.ACTIVE)
+                .currency(currency)
+                .overdraftLimit(BigDecimal.ZERO)
+                .build();
+
+        account = accountRepository.save(account);
+
+        // Pre-initialize partitioned balance buckets for the account
         try {
             accountBucketService.getOrInitializeBuckets(account);
-        } catch (DataAccessException | IllegalStateException e) {
-            // Eliminated generic Exception catching. Log specifically.
-            log.error("Non-fatal: Failed to pre-init buckets for account {}. Reason: {}", account.getAccountNumber(), e.getMessage());
+        } catch (Exception e) {
+            log.debug("Could not pre-init buckets: {}", e.getMessage());
         }
 
-        // Publish event for downstream async processing (e.g., Kafka, Notifications)
-        eventPublisher.publishEvent(new AccountCreatedEvent(this, account.getAccountNumber(), username));
+        // Auto-create a permanent account QR so the iOS app can show it immediately.
+        try {
+            qrPaymentService.getOrCreateAccountQr(account.getAccountNumber(), username);
+            log.debug("Account QR auto-created for new account: {}", account.getAccountNumber());
+        } catch (Exception e) {
+            log.warn("⚠️ Could not auto-create account QR for {}: {}", account.getAccountNumber(), e.getMessage());
+        }
 
-        return mapToAccountResponse(account);
+        return account;
     }
 
     @Transactional(readOnly = true)
-    public List<AccountResponse> getMyAccounts(String username) {
-        Assert.hasText(username, "Username must not be blank");
-
+    public List<Account> getMyAccounts(String username) {
         List<Account> accounts = accountRepository.findByUserUsername(username);
-
-        // Maps entities to immutable records/DTOs to avoid @Transient domain leaks
-        return accounts.stream()
-                .map(this::mapToAccountResponse)
-                .toList();
-    }
-
-    @Transactional(readOnly = true)
-    public AccountResponse getAccountById(Long id, String username) {
-        Assert.notNull(id, "Account ID must not be null");
-        Assert.hasText(username, "Username must not be blank");
-
-        Account account = accountRepository.findById(id)
-                .orElseThrow(() -> new ResourceNotFoundException("Account ID " + id + " not found"));
-
-        verifyAccountOwnership(account, username);
-
-        return mapToAccountResponse(account);
-    }
-
-    @Transactional(readOnly = true)
-    public BigDecimal getBalance(String accountNumber, String username) {
-        Assert.hasText(accountNumber, "Account number must not be blank");
-        Assert.hasText(username, "Username must not be blank");
-
-        Account account = accountRepository.findByAccountNumber(accountNumber)
-                .orElseThrow(() -> new ResourceNotFoundException("Account Number " + accountNumber + " not found"));
-
-        verifyAccountOwnership(account, username);
-
-        return accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance());
-    }
-
-    /**
-     * Centralized IDOR (Insecure Direct Object Reference) Prevention.
-     * ការពារមិនឲ្យអ្នកប្រើប្រាស់ចូលមើលទិន្នន័យគណនីរបស់អ្នកដទៃបាន។
-     */
-    private void verifyAccountOwnership(Account account, String username) {
-        if (!account.getUser().getUsername().equals(username)) {
-            log.warn("Security Alert: User {} attempted unauthorized access on Account ID {}", username, account.getId());
-            throw new AccessDeniedException("Unauthorized: You do not have permission to access this account.");
+        for (Account account : accounts) {
+            BigDecimal aggregated = accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance());
+            account.setBalance(aggregated);
         }
+        return accounts;
     }
 
-    /**
-     * Factory method for mapping Domain Entity to Presentation DTO.
-     * ជៀសវាងការប្រើ @Transient ក្នុង Entity ដើម្បីរក្សាស្ថាបត្យកម្មឲ្យស្អាត។
-     */
-    private AccountResponse mapToAccountResponse(Account account) {
-        BigDecimal aggregated = accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance());
+    @Transactional(readOnly = true)
+    public java.util.Optional<Account> getAccountById(Long id) {
+        return accountRepository.findById(id).map(account -> {
+            BigDecimal aggregated = accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance());
+            account.setBalance(aggregated);
+            return account;
+        });
+    }
 
-        // Requires creating AccountResponse record containing these fields
-        return new AccountResponse(
-                account.getId(),
-                account.getAccountNumber(),
-                account.getAccountType(),
-                account.getCurrency(),
-                account.getBalance(),
-                aggregated,
-                account.getStatus()
-        );
+    @Transactional(readOnly = true)
+    public BigDecimal getBalance(String accountNumber) {
+        return accountRepository.findByAccountNumber(accountNumber)
+                .map(account -> accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance()))
+                .orElse(BigDecimal.ZERO);
     }
 }
