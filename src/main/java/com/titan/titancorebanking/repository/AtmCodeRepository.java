@@ -1,12 +1,13 @@
 package com.titan.titancorebanking.repository;
 
 import com.titan.titancorebanking.model.AtmCode;
-import com.titan.titancorebanking.model.AtmCode.AtmCodeStatus;
 import jakarta.persistence.LockModeType;
+import jakarta.persistence.QueryHint;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
@@ -17,28 +18,27 @@ import java.util.Optional;
 @Repository
 public interface AtmCodeRepository extends JpaRepository<AtmCode, Long> {
 
+    Optional<AtmCode> findByCode(String code);
+
+    List<AtmCode> findByAccount_IdAndStatus(Long accountId, AtmCode.AtmCodeStatus status);
+
     /**
-     * Pessimistic-write lock so the ATM terminal and expiry-sweep
-     * job cannot race against each other.
+     * Pessimistic Write Lock to prevent concurrent double-redemption of the same ATM code.
      */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
     @Query("SELECT a FROM AtmCode a WHERE a.code = :code")
     Optional<AtmCode> findByCodeWithLock(@Param("code") String code);
 
-    /** Read-only lookup (no lock). */
-    Optional<AtmCode> findByCode(String code);
-
-    /** Find all pending codes for a specific account (to cancel on new generation). */
-    List<AtmCode> findByAccount_IdAndStatus(Long accountId, AtmCodeStatus status);
-
-    /** Expired codes that still have PENDING status — used by the cleanup scheduler. */
-    @Query("SELECT a FROM AtmCode a WHERE a.status = 'PENDING' AND a.expiresAt < :now")
-    List<AtmCode> findExpiredPendingCodes(@Param("now") LocalDateTime now);
-
     /**
-     * Bulk-expire codes in one UPDATE to keep the cleanup job lightweight.
+     * Batch expiration executed entirely inside the database engine to avoid JVM heap pressure.
      */
     @Modifying
-    @Query("UPDATE AtmCode a SET a.status = 'EXPIRED' WHERE a.status = 'PENDING' AND a.expiresAt < :now")
+    @Query("""
+        UPDATE AtmCode a 
+        SET a.status = com.titan.titancorebanking.model.AtmCode$AtmCodeStatus.EXPIRED 
+        WHERE a.status = com.titan.titancorebanking.model.AtmCode$AtmCodeStatus.PENDING 
+        AND a.expiresAt < :now
+    """)
     int expirePendingCodes(@Param("now") LocalDateTime now);
 }
