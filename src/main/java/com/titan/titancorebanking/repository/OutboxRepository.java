@@ -12,22 +12,19 @@ import java.util.List;
 
 @Repository
 public interface OutboxRepository extends JpaRepository<OutboxEvent, Long> {
-    
-    /**
-     * Fetch pending events with retry limit for batch processing
-     */
-    List<OutboxEvent> findTop100ByPublishedFalseAndRetryCountLessThanOrderByCreatedAtAsc(int maxRetries);
-    
-    /**
-     * Count events stuck in retry loop (for monitoring)
-     */
-    @Query("SELECT COUNT(e) FROM OutboxEvent e WHERE e.published = false AND e.retryCount >= :maxRetries")
+
+    @Query(value = """
+        SELECT * FROM outbox_events 
+        WHERE published = false AND retry_count < :maxRetries 
+        ORDER BY created_at ASC 
+        LIMIT 100 
+        FOR UPDATE SKIP LOCKED
+        """, nativeQuery = true)
+    List<OutboxEvent> findPendingEventsForUpdate(@Param("maxRetries") int maxRetries);
+
+    @Query("SELECT COUNT(o) FROM OutboxEvent o WHERE o.retryCount >= :maxRetries")
     Long countFailedEvents(@Param("maxRetries") int maxRetries);
-    
-    /**
-     * Cleanup old published events (retention policy)
-     */
+
     @Modifying
-    @Query("DELETE FROM OutboxEvent o WHERE o.published = true AND o.createdAt < :cutoff")
-    int deleteByPublishedTrueAndCreatedAtBefore(@Param("cutoff") Instant cutoff);
+    int deleteByPublishedTrueAndCreatedAtBefore(Instant cutoff);
 }
