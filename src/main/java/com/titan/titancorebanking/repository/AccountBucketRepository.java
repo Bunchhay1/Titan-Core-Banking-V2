@@ -19,20 +19,26 @@ public interface AccountBucketRepository extends JpaRepository<AccountBucket, Lo
 
     List<AccountBucket> findByParentAccountId(Long parentAccountId);
 
-    @Lock(LockModeType.PESSIMISTIC_WRITE)
-    @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
-    @Query("SELECT b FROM AccountBucket b WHERE b.id = :id")
-    Optional<AccountBucket> findByIdWithLock(@Param("id") Long id);
+    @Query("SELECT DISTINCT a.parentAccount.id FROM AccountBucket a WHERE a.balance > 0")
+    List<Long> findDistinctParentAccountIds();
 
+    /**
+     * Pessimistically locks a specific partition bucket for a merchant account.
+     * Prevents update-loss without blocking the other 7 partitions.
+     */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
     @Query("SELECT b FROM AccountBucket b WHERE b.parentAccount.id = :parentAccountId AND b.bucketIndex = :bucketIndex")
     Optional<AccountBucket> findByParentAccountIdAndBucketIndexWithLock(
             @Param("parentAccountId") Long parentAccountId,
-            @Param("bucketIndex") int bucketIndex);
+            @Param("bucketIndex") int bucketIndex
+    );
 
-    Optional<AccountBucket> findByParentAccountIdAndBucketIndex(Long parentAccountId, int bucketIndex);
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
+    @Query("SELECT b FROM AccountBucket b WHERE b.id = :id")
+    Optional<AccountBucket> findByIdWithLock(@Param("id") Long id);
 
-    @Query("SELECT COALESCE(SUM(b.balance), 0) FROM AccountBucket b WHERE b.parentAccount.id = :parentAccountId")
+    @Query("SELECT SUM(b.balance) FROM AccountBucket b WHERE b.parentAccount.id = :parentAccountId")
     BigDecimal sumBucketBalancesByParentAccountId(@Param("parentAccountId") Long parentAccountId);
 }
