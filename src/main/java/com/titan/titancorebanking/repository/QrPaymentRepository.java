@@ -1,12 +1,10 @@
 package com.titan.titancorebanking.repository;
 
 import com.titan.titancorebanking.model.QrPayment;
-import com.titan.titancorebanking.model.QrPayment.QrStatus;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
-import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
@@ -19,30 +17,33 @@ import java.util.Optional;
 @Repository
 public interface QrPaymentRepository extends JpaRepository<QrPayment, Long> {
 
-    // ✅ Pessimistic row-level lock on QR code to prevent double redemption race conditions
+    boolean existsByQrCode(String qrCode);
+
+    Optional<QrPayment> findByQrCode(String qrCode);
+
+    /**
+     * Critical guard against Double-Spend attacks.
+     * Pessimistically locks the QR token row so that concurrent scans are serialized.
+     */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
     @Query("SELECT q FROM QrPayment q WHERE q.qrCode = :qrCode")
     Optional<QrPayment> findByQrCodeWithLock(@Param("qrCode") String qrCode);
 
-    // ✅ Look up a QR by its token (called when payer scans)
-    Optional<QrPayment> findByQrCode(String qrCode);
+    Optional<QrPayment> findByPayeeAccount_AccountNumberAndNote(String accountNumber, String note);
 
-    // ✅ All QRs created for a specific payee account
     List<QrPayment> findByPayeeAccount_AccountNumberOrderByCreatedAtDesc(String accountNumber);
 
-    // ✅ Find only pending QRs (for expiry check, polling, etc.)
-    List<QrPayment> findByStatus(QrStatus status);
-
-    // ✅ Bulk-expire QRs whose TTL has passed
-    @Modifying
-    @Query("UPDATE QrPayment q SET q.status = 'EXPIRED' " +
-           "WHERE q.status = 'PENDING' AND q.expiresAt < :now")
+    /**
+     * Batch expires stale QR codes efficiently at the database level, avoiding
+     * the overhead of loading thousands of entities into the JVM persistence context.
+     */
+    @org.springframework.data.jpa.repository.Modifying
+    @Query("""
+        UPDATE QrPayment q 
+        SET q.status = com.titan.titancorebanking.model.QrPayment$QrStatus.EXPIRED 
+        WHERE q.status = com.titan.titancorebanking.model.QrPayment$QrStatus.PENDING 
+        AND q.expiresAt < :now AND q.note != 'ACCOUNT_QR'
+    """)
     int expireStaleQrCodes(@Param("now") LocalDateTime now);
-
-    // ✅ Check if a QR code already exists (used during token generation to guarantee uniqueness)
-    boolean existsByQrCode(String qrCode);
-
-    // ✅ Find a persistent account QR by account number + note marker (for get-or-create logic)
-    Optional<QrPayment> findByPayeeAccount_AccountNumberAndNote(String accountNumber, String note);
 }
