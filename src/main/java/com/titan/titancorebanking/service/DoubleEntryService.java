@@ -36,7 +36,7 @@ public class DoubleEntryService {
             throw new IllegalArgumentException("Amount must be positive");
         }
 
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = LocalDateTime.now(java.time.ZoneOffset.UTC); // always UTC
 
         LedgerEntry debitEntry = LedgerEntry.builder()
                 .transactionId(transactionId)
@@ -63,6 +63,55 @@ public class DoubleEntryService {
 
         log.debug("Created double-entry for transaction {} - Debit: {}, Credit: {}, Amount: {}",
                 transactionId, debitAccountId, creditAccountId, amount);
+    }
+
+    /**
+     * Creates transfer double-entry records accounting for fee.
+     * The sender is debited for total deduction (amount + fee).
+     * The receiver is credited for base transfer amount.
+     * Propagation.MANDATORY strictly enforces execution inside an existing transaction.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void createTransferDoubleEntry(Long transactionId,
+                                          Long debitAccountId,
+                                          Long creditAccountId,
+                                          BigDecimal amount,
+                                          BigDecimal fee,
+                                          String description,
+                                          String userId) {
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Amount must be positive");
+        }
+        BigDecimal actualFee = fee != null ? fee : BigDecimal.ZERO;
+        BigDecimal totalDeduction = amount.add(actualFee);
+
+        LocalDateTime now = LocalDateTime.now(java.time.ZoneOffset.UTC); // always UTC
+
+        LedgerEntry debitEntry = LedgerEntry.builder()
+                .transactionId(transactionId)
+                .accountId(debitAccountId)
+                .entryType(LedgerEntry.EntryType.DEBIT)
+                .amount(totalDeduction)
+                .entryDate(now)
+                .description(description)
+                .createdBy(userId)
+                .build();
+
+        LedgerEntry creditEntry = LedgerEntry.builder()
+                .transactionId(transactionId)
+                .accountId(creditAccountId)
+                .entryType(LedgerEntry.EntryType.CREDIT)
+                .amount(amount)
+                .entryDate(now)
+                .description(description)
+                .createdBy(userId)
+                .build();
+
+        ledgerRepository.save(debitEntry);
+        ledgerRepository.save(creditEntry);
+
+        log.debug("Created transfer double-entry for transaction {} - Debit: {} (total: {}), Credit: {} (amount: {})",
+                transactionId, debitAccountId, totalDeduction, creditAccountId, amount);
     }
 
     @Transactional(readOnly = true)
