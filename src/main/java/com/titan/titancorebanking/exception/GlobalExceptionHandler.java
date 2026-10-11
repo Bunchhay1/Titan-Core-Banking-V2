@@ -1,6 +1,7 @@
 package com.titan.titancorebanking.exception;
 
 import com.titan.titancorebanking.dto.response.ErrorResponse;
+import com.titan.titancorebanking.exception.DailyLimitExceededException;
 import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -39,6 +40,18 @@ public class GlobalExceptionHandler {
         response.put("details", errors);
 
         return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
+    }
+
+    @ExceptionHandler(DailyLimitExceededException.class)
+    public ResponseEntity<ErrorResponse> handleDailyLimitExceeded(DailyLimitExceededException ex, WebRequest request) {
+        ErrorResponse errorResponse = ErrorResponse.builder()
+                .timestamp(LocalDateTime.now())
+                .status(HttpStatus.UNPROCESSABLE_ENTITY.value())
+                .error("Daily Transfer Limit Exceeded")
+                .message(ex.getMessage())
+                .path(request.getDescription(false).replace("uri=", ""))
+                .build();
+        return new ResponseEntity<>(errorResponse, HttpStatus.UNPROCESSABLE_ENTITY);
     }
 
     @ExceptionHandler(InsufficientBalanceException.class)
