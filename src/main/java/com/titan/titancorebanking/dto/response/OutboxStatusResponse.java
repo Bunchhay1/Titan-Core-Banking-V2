@@ -3,12 +3,15 @@ package com.titan.titancorebanking.dto.response;
 import java.time.Instant;
 
 /**
- * Response for outbox monitoring endpoints
+ * Immutable Outbox Status Response.
+ * Used by the system administration endpoints to monitor Kafka relay health.
  */
 public record OutboxStatusResponse(
-    Long totalPending,
-    Long totalPublished,
-    Long totalFailed,
-    Instant oldestPending,
-    Double avgPublishTimeSeconds
+        Long pendingEvents,
+        Long publishedEvents,
+        Long failedEvents,
+        Instant oldestPendingEvent,
+        Double avgPublishTimeSeconds,
+        Boolean relayLocked,
+        Instant timestamp
 ) {}
