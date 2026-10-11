@@ -27,11 +27,11 @@ public class ExchangeRateService {
         // Formula: (Amount / fromRate) * toRate
         // Example: KHR -> EUR = (Amount / 4100) * 0.92
 
-        return toRate.divide(fromRate, 6, RoundingMode.HALF_UP);
+        return toRate.divide(fromRate, 6, RoundingMode.HALF_EVEN);
     }
 
     public BigDecimal convert(BigDecimal amount, Currency from, Currency to) {
         BigDecimal rate = getRate(from, to);
-        return amount.multiply(rate).setScale(2, RoundingMode.HALF_UP);
+        return amount.multiply(rate).setScale(4, RoundingMode.HALF_EVEN);
     }
 }
