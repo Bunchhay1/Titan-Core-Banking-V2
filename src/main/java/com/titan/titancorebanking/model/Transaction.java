@@ -42,6 +42,18 @@ public class Transaction {
     @Column(nullable = false, precision = 30, scale = 4)
     private BigDecimal amount;
 
+    /**
+     * Fee charged for this transaction.
+     * ZERO for deposits and withdrawals; the strategy-calculated fee for transfers.
+     * Recorded so the response, ledger, and reconciliation can verify:
+     *   fromAccount debit == amount + fee
+     *   toAccount credit  == amount (no fee)
+     *   ledger debit entry == amount + fee
+     */
+    @Builder.Default
+    @Column(nullable = false, precision = 30, scale = 4)
+    private BigDecimal fee = BigDecimal.ZERO;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
     private TransactionStatus status;
