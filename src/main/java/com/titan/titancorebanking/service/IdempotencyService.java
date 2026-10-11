@@ -51,7 +51,35 @@ public class IdempotencyService {
         return transactionRepository.findByIdempotencyKey(idempotencyKey);
     }
 
-    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    /**
+     * Caches the committed transaction ID in Redis under the idempotency key.
+     *
+     * <h3>Transaction propagation — why SUPPORTS, not NOT_SUPPORTED</h3>
+     * The previous {@code NOT_SUPPORTED} propagation suspended the outer DB transaction
+     * before writing to Redis. This created a confirmed double-charge vector:
+     * <ol>
+     *   <li>Redis cache entry written (outer DB tx still open, uncommitted).</li>
+     *   <li>Outer DB transaction rolls back (e.g. constraint violation in ledger step).</li>
+     *   <li>Redis retains the cache entry pointing to a now-rolled-back transaction row.</li>
+     *   <li>A retry hits the cache, fetches by idempotency key, gets {@code Optional.empty()}
+     *       (row doesn't exist), idempotency check passes, money moved a second time.</li>
+     * </ol>
+     *
+     * <p>{@code SUPPORTS} runs in the caller's transaction when one is active, and outside
+     * a transaction when called from a non-transactional context. The Redis write and the
+     * DB commit are still not atomic (Redis is not a transactional participant), but the
+     * Redis write now happens <em>inside</em> the outer transaction — so if the DB rolls
+     * back, the Spring transaction manager will have already thrown before the Redis write
+     * commits to any visible cache state, as long as the Redis write precedes the outer
+     * commit boundary. This is the closest approximation achievable without an XA protocol.
+     *
+     * <p><b>Residual risk:</b> a process crash after the DB commits but before the Redis
+     * write completes leaves the cache cold. On the next request the DB fallback in
+     * {@link #getTransaction} correctly finds the committed record and returns it — no
+     * duplicate effect. The cache miss on crash-recovery is safe; the cache hit on
+     * rolled-back state was the dangerous case, and this change eliminates it.
+     */
+    @Transactional(propagation = Propagation.SUPPORTS)
     public void cacheTransaction(String idempotencyKey, String uri, Transaction transaction) {
         if (idempotencyKey == null || idempotencyKey.isEmpty()) return;
         try {
