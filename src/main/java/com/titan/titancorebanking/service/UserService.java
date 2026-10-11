@@ -11,7 +11,6 @@ import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-
 import java.util.List;
 
 @Service
@@ -27,35 +26,30 @@ public class UserService implements UserDetailsService {
                 .orElseThrow(() -> new UsernameNotFoundException("User not found"));
     }
 
-    // ✅ Added: Get All Users
     public List<User> getAllUsers() {
         return userRepository.findAll();
     }
 
-    // ✅ Added: Get User By ID
     public User getUserById(Long id) {
         return userRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("User not found with ID: " + id));
     }
 
-    // ✅ Added: Create User (from DTO)
     public User createUser(RegisterRequest request) {
-        if (userRepository.existsByUsername(request.getUsername())) {
+        if (userRepository.existsByUsername(request.username())) {
             throw new RuntimeException("Username already exists");
         }
-
         User user = User.builder()
-                .firstName(request.getFirstName())
-                .lastName(request.getLastName())
-                .email(request.getEmail())
-                .username(request.getUsername())
-                .password(passwordEncoder.encode(request.getPassword()))
-                .pin(passwordEncoder.encode(request.getPin()))
+                .firstName(request.firstName())
+                .lastName(request.lastName())
+                .email(request.email())
+                .username(request.username())
+                .password(passwordEncoder.encode(request.password()))
+                .pin(passwordEncoder.encode(request.pin()))
                 .build();
-
         return userRepository.save(user);
     }
-    
+
     @Transactional
     public User updateUserTier(Long userId, UserTier newTier) {
         User user = getUserById(userId);
