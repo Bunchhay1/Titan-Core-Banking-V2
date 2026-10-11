@@ -12,22 +12,19 @@ import java.util.List;
 
 @Repository
 public interface LedgerRepository extends JpaRepository<LedgerEntry, Long> {
-    
-    List<LedgerEntry> findByTransactionId(Long transactionId);
-    
-    List<LedgerEntry> findByAccountIdOrderByEntryDateDesc(Long accountId);
-    
-    @Query("SELECT SUM(CASE WHEN l.entryType = 'DEBIT' THEN -l.amount ELSE l.amount END) " +
-           "FROM LedgerEntry l WHERE l.accountId = :accountId")
-    BigDecimal calculateAccountBalance(@Param("accountId") Long accountId);
-    
-    @Query("SELECT SUM(CASE WHEN l.entryType = 'DEBIT' THEN -l.amount ELSE l.amount END) " +
-           "FROM LedgerEntry l WHERE l.accountId = :accountId AND l.entryDate <= :asOfDate")
-    BigDecimal calculateBalanceAsOf(@Param("accountId") Long accountId, 
-                                    @Param("asOfDate") LocalDateTime asOfDate);
 
-    // Task 5: Merkle pruning — fetch old entries in batches
-    @Query(value = "SELECT * FROM ledger_entry WHERE entry_date < :cutoff ORDER BY id LIMIT :limit",
-           nativeQuery = true)
-    List<LedgerEntry> findOlderThan(@Param("cutoff") LocalDateTime cutoff, @Param("limit") int limit);
+    @Query("""
+        SELECT SUM(CASE WHEN l.entryType = 'CREDIT' THEN l.amount ELSE -l.amount END) 
+        FROM LedgerEntry l 
+        WHERE l.accountId = :accountId
+    """)
+    BigDecimal calculateAccountBalance(@Param("accountId") Long accountId);
+
+    @Query(value = """
+        SELECT * FROM ledger_entry 
+        WHERE entry_date < :cutoffDate 
+        ORDER BY id ASC 
+        LIMIT :batchSize
+    """, nativeQuery = true)
+    List<LedgerEntry> findOlderThan(@Param("cutoffDate") LocalDateTime cutoffDate, @Param("batchSize") int batchSize);
 }
