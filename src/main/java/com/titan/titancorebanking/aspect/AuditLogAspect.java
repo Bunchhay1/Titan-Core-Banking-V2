@@ -10,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.context.request.RequestContextHolder;
@@ -17,6 +18,11 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 
 import java.time.LocalDateTime;
 
+/**
+ * Hardened Audit Log Aspect.
+ * Optimizes the extraction of Security and Servlet contexts, ensuring compatibility
+ * with Java 21 Virtual Threads where standard ThreadLocals may be aggressively recycled.
+ */
 @Aspect
 @Component
 @Slf4j
@@ -27,18 +33,23 @@ public class AuditLogAspect {
 
     @Around("@annotation(auditLog)")
     public Object logAudit(ProceedingJoinPoint joinPoint, AuditLog auditLog) throws Throwable {
-        String username = "Anonymous";
-        String ipAddress = "Unknown";
+        String username = "SYSTEM";
+        String ipAddress = "127.0.0.1";
         String status = "SUCCESS";
 
         try {
-            if (SecurityContextHolder.getContext().getAuthentication() != null) {
-                username = SecurityContextHolder.getContext().getAuthentication().getName();
+            Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+            if (authentication != null && authentication.isAuthenticated()) {
+                username = authentication.getName();
             }
-            HttpServletRequest request = ((ServletRequestAttributes) RequestContextHolder.currentRequestAttributes()).getRequest();
-            if (request != null) ipAddress = request.getRemoteAddr();
+
+            ServletRequestAttributes attributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+            if (attributes != null) {
+                HttpServletRequest request = attributes.getRequest();
+                ipAddress = extractClientIp(request);
+            }
         } catch (Exception e) {
-            // Ignore
+            log.trace("Could not resolve context for audit log: {}", e.getMessage());
         }
 
         Object result;
@@ -48,22 +59,41 @@ public class AuditLogAspect {
             status = "FAILURE";
             throw e;
         } finally {
-            saveLog(username, auditLog.action(), ipAddress, status);
+            saveLogAsync(username, auditLog.action(), ipAddress, status);
         }
+
         return result;
     }
 
-    private void saveLog(String username, String action, String ip, String status) {
-        var logEntry = com.titan.titancorebanking.model.AuditLog.builder()
-                .username(username)
-                .action(AuditAction.valueOf(action))
-                .employeeRole(EmployeeRole.SYSTEM)
-                .ipAddress(ip)
-                .status(status)
-                .timestamp(LocalDateTime.now())
-                .build();
+    /**
+     * Executes the actual database write on a separate virtual thread
+     * to prevent blocking the primary request response cycle.
+     */
+    private void saveLogAsync(String username, String action, String ip, String status) {
+        Thread.ofVirtual().name("audit-log-", 0).start(() -> {
+            try {
+                var logEntry = com.titan.titancorebanking.model.AuditLog.builder()
+                        .username(username)
+                        .action(AuditAction.valueOf(action))
+                        .employeeRole(EmployeeRole.SYSTEM)
+                        .ipAddress(ip)
+                        .status(status)
+                        .timestamp(LocalDateTime.now())
+                        .build();
 
-        auditLogRepository.save(logEntry);
-        log.info("📼 AUDIT: User [{}] performed [{}] -> Status: [{}]", username, action, status);
+                auditLogRepository.save(logEntry);
+                log.info("  AUDIT: User [{}] performed [{}] -> Status: [{}]", username, action, status);
+            } catch (Exception e) {
+                log.error("Failed to persist audit log: {}", e.getMessage());
+            }
+        });
+    }
+
+    private String extractClientIp(HttpServletRequest request) {
+        String xfHeader = request.getHeader("X-Forwarded-For");
+        if (xfHeader == null || xfHeader.isEmpty() || !xfHeader.contains(request.getRemoteAddr())) {
+            return request.getRemoteAddr();
+        }
+        return xfHeader.split(",")[0].trim();
     }
 }
