@@ -1,4 +1,9 @@
 package com.titan.titancorebanking.htlc;
 
-public class HtlcRepository {
+import org.springframework.data.jpa.repository.JpaRepository;
+import java.time.LocalDateTime;
+import java.util.List;
+
+public interface HtlcRepository extends JpaRepository<HtlcContract, String> {
+    List<HtlcContract> findByStatusAndExpiresAtBefore(HtlcContract.HtlcStatus status, LocalDateTime now);
 }
