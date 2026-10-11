@@ -1,4 +1,37 @@
-package com.titan.titancorebanking.failsafe;
+package com.titan.titancorebanking.merkle;
 
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "merkle_archive", indexes = {
+        @Index(name = "idx_merkle_root", columnList = "merkleRoot", unique = true)
+})
+@Getter
+@Setter
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
 public class MerkleArchiveRecord {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 64, unique = true)
+    private String merkleRoot;
+
+    @Column(nullable = false)
+    private String s3ArchiveKey;
+
+    @Column(nullable = false)
+    private int entryCount;
+
+    @Column(nullable = false)
+    private Long firstEntryId;
+
+    @Column(nullable = false)
+    private Long lastEntryId;
+
+    @Column(nullable = false)
+    private LocalDateTime archivedAt;
 }
