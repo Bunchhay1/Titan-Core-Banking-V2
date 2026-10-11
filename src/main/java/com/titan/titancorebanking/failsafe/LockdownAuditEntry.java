@@ -1,4 +1,24 @@
 package com.titan.titancorebanking.failsafe;
 
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "lockdown_audit")
+@Getter
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
 public class LockdownAuditEntry {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 1000)
+    private String reason;
+
+    @Column(nullable = false, updatable = false)
+    private LocalDateTime triggeredAt;
 }
