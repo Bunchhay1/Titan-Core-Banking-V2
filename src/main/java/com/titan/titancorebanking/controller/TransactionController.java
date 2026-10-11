@@ -128,7 +128,7 @@ public class TransactionController {
                 tx.getNote(),
                 tx.getTimestamp(),
                 currency,
-                java.math.BigDecimal.ZERO,
+                tx.getFee() != null ? tx.getFee() : java.math.BigDecimal.ZERO,
                 tx.getTransactionReference()
         );
     }
