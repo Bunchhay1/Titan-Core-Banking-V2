@@ -1,33 +1,40 @@
 package com.titan.titancorebanking.service;
 
 import com.titan.titancorebanking.dto.request.AccountRequest;
+import com.titan.titancorebanking.dto.request.TransactionRequest;
 import com.titan.titancorebanking.model.Account;
+import com.titan.titancorebanking.model.Transaction;
 import com.titan.titancorebanking.model.User;
 import com.titan.titancorebanking.enums.AccountType;
 import com.titan.titancorebanking.enums.AccountStatus;
 import com.titan.titancorebanking.enums.Currency;
+import com.titan.titancorebanking.enums.TransactionStatus;
+import com.titan.titancorebanking.enums.TransactionType;
 import com.titan.titancorebanking.repository.AccountRepository;
+import com.titan.titancorebanking.repository.TransactionRepository;
 import com.titan.titancorebanking.repository.UserRepository;
 import com.titan.titancorebanking.utils.AccountNumberUtils;
-
+import com.titan.titancorebanking.service.imple.OtpService;
+import com.titan.titancorebanking.service.imple.ExchangeRateService;
+import com.titan.titancorebanking.exception.InsufficientBalanceException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.context.annotation.Lazy;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import io.github.resilience4j.retry.annotation.Retry;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 
-/**
- * Strictly handles Account Lifecycle Management.
- * SRP Enforced: Transaction and Transfer logic has been extracted to TransactionOrchestratorService.
- */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -37,13 +44,12 @@ public class AccountService {
     private final UserRepository userRepository;
     private final AccountBucketService accountBucketService;
 
-    // @Lazy breaks the circular dependency:
-    // AccountService → QrPaymentService → AccountRepository (← same bean AccountService uses)
     @Autowired
     @Lazy
     private QrPaymentService qrPaymentService;
 
     private static final int MAX_ACCOUNTS = 10;
+    private static final int ACCOUNT_GENERATION_MAX_RETRIES = 5;
 
     @Transactional
     @CacheEvict(value = "user_accounts", key = "#username")
@@ -53,39 +59,19 @@ public class AccountService {
                 .orElseThrow(() -> new UsernameNotFoundException("User not found"));
 
         if (accountRepository.countByUser(user) >= MAX_ACCOUNTS) {
-            throw new RuntimeException("⛔ Limit Reached: You can only create " + MAX_ACCOUNTS + " accounts.");
+            throw new IllegalStateException("Limit Reached: You can only create " + MAX_ACCOUNTS + " accounts.");
         }
 
-        AccountType type = AccountType.SAVINGS;
-        if (request.getAccountType() != null) {
-            try {
-                type = AccountType.valueOf(request.getAccountType().toUpperCase());
-            } catch (IllegalArgumentException e) {
-                log.warn("Invalid AccountType: {}. Defaulting to SAVINGS.", request.getAccountType());
-            }
-        }
+        // Updated for Java 21 Record accessors
+        AccountType type = parseEnum(AccountType.class, request.accountType(), AccountType.SAVINGS);
+        Currency currency = parseEnum(Currency.class, request.currency(), Currency.USD);
 
-        Currency currency = Currency.USD;
-        if (request.getCurrency() != null) {
-            try {
-                currency = Currency.valueOf(request.getCurrency().toUpperCase());
-            } catch (Exception e) {
-                log.warn("Invalid Currency: {}. Defaulting to USD.", request.getCurrency());
-            }
-        }
-
-        String newAccountNumber;
-        int attempts = 0;
-        do {
-            newAccountNumber = AccountNumberUtils.generateAccountNumber();
-            attempts++;
-            if (attempts > 5) throw new RuntimeException("🔥 System Busy: Could not generate unique account number.");
-        } while (accountRepository.existsByAccountNumber(newAccountNumber));
+        String newAccountNumber = generateUniqueAccountNumber();
 
         Account account = Account.builder()
                 .accountNumber(newAccountNumber)
                 .accountType(type)
-                .balance(request.getInitialDeposit() != null ? request.getInitialDeposit() : BigDecimal.ZERO)
+                .balance(request.initialDeposit() != null ? request.initialDeposit() : BigDecimal.ZERO)
                 .user(user)
                 .createdAt(LocalDateTime.now())
                 .status(AccountStatus.ACTIVE)
@@ -95,19 +81,16 @@ public class AccountService {
 
         account = accountRepository.save(account);
 
-        // Pre-initialize partitioned balance buckets for the account
         try {
             accountBucketService.getOrInitializeBuckets(account);
         } catch (Exception e) {
-            log.debug("Could not pre-init buckets: {}", e.getMessage());
+            log.warn("Could not pre-init buckets for account {}: {}", account.getAccountNumber(), e.getMessage());
         }
 
-        // Auto-create a permanent account QR so the iOS app can show it immediately.
         try {
             qrPaymentService.getOrCreateAccountQr(account.getAccountNumber(), username);
-            log.debug("Account QR auto-created for new account: {}", account.getAccountNumber());
         } catch (Exception e) {
-            log.warn("⚠️ Could not auto-create account QR for {}: {}", account.getAccountNumber(), e.getMessage());
+            log.warn("Could not auto-create static QR for {}: {}", account.getAccountNumber(), e.getMessage());
         }
 
         return account;
@@ -124,7 +107,7 @@ public class AccountService {
     }
 
     @Transactional(readOnly = true)
-    public java.util.Optional<Account> getAccountById(Long id) {
+    public Optional<Account> getAccountById(Long id) {
         return accountRepository.findById(id).map(account -> {
             BigDecimal aggregated = accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance());
             account.setBalance(aggregated);
@@ -137,5 +120,28 @@ public class AccountService {
         return accountRepository.findByAccountNumber(accountNumber)
                 .map(account -> accountBucketService.calculateTotalAggregatedBalance(account.getId(), account.getBalance()))
                 .orElse(BigDecimal.ZERO);
+    }
+
+    private String generateUniqueAccountNumber() {
+        String newAccountNumber;
+        int attempts = 0;
+        do {
+            newAccountNumber = AccountNumberUtils.generateAccountNumber();
+            attempts++;
+            if (attempts > ACCOUNT_GENERATION_MAX_RETRIES) {
+                throw new IllegalStateException("System Busy: Could not generate a unique account number after multiple attempts.");
+            }
+        } while (accountRepository.existsByAccountNumber(newAccountNumber));
+        return newAccountNumber;
+    }
+
+    private <T extends Enum<T>> T parseEnum(Class<T> enumType, String value, T defaultValue) {
+        if (value == null || value.isBlank()) return defaultValue;
+        try {
+            return Enum.valueOf(enumType, value.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            log.warn("Invalid enum value for {}: {}. Defaulting to {}.", enumType.getSimpleName(), value, defaultValue);
+            return defaultValue;
+        }
     }
 }
