@@ -1,15 +1,11 @@
-package com.titan.titancorebanking.dto.request; // ឬ dto តាម Commander ដាក់
+package com.titan.titancorebanking.dto.request;
 
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import jakarta.validation.constraints.NotBlank;
 
-@Data
-@Builder
-@AllArgsConstructor
-@NoArgsConstructor
-public class LoginRequest {
-    private String username;
-    private String password;
-}
+public record LoginRequest(
+        @NotBlank(message = "Username is required")
+        String username,
+
+        @NotBlank(message = "Password is required")
+        String password
+) {}
