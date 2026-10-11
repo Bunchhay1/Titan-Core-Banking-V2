@@ -11,7 +11,7 @@ public class PlatinumFeeStrategy implements FeeStrategy {
 
     @Override
     public BigDecimal calculateFee(BigDecimal amount) {
-        return amount.multiply(RATE);
+        return amount.multiply(RATE).setScale(4, java.math.RoundingMode.HALF_EVEN);
     }
 
     @Override
