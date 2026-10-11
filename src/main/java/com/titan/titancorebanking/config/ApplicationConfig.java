@@ -11,22 +11,25 @@ import org.springframework.security.config.annotation.authentication.configurati
 import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
-import org.springframework.security.crypto.password.PasswordEncoder;import org.springframework.web.client.RestTemplate;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.client.RestClient;
 
+/**
+ * Core Application Configuration.
+ * Elevates the BCrypt work factor to 12 for enterprise-grade brute-force resistance.
+ */
 @Configuration
 @RequiredArgsConstructor
 public class ApplicationConfig {
 
-    private final UserRepository repository;
+    private final UserRepository userRepository;
 
-    // 1. ប្រាប់ Spring ថាត្រូវរក User តាម Username ដោយរបៀបណា
     @Bean
     public UserDetailsService userDetailsService() {
-        return username -> repository.findByUsername(username)
+        return username -> userRepository.findByUsername(username)
                 .orElseThrow(() -> new UsernameNotFoundException("User not found"));
     }
 
-    // 2. ភ្ជាប់ UserDetailsService ជាមួយ PasswordEncoder ដើម្បីបង្កើតជាអ្នកត្រួតពិនិត្យ
     @Bean
     public AuthenticationProvider authenticationProvider() {
         DaoAuthenticationProvider authProvider = new DaoAuthenticationProvider();
@@ -35,19 +38,19 @@ public class ApplicationConfig {
         return authProvider;
     }
 
-    // 3. អ្នកគ្រប់គ្រងការ Login (AuthenticationManager)
     @Bean
     public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
         return config.getAuthenticationManager();
     }
 
-    // 4. ឧបករណ៍បម្លែង Password
     @Bean
     public PasswordEncoder passwordEncoder() {
-        return new BCryptPasswordEncoder();
+        // Elevated work factor for banking security standards
+        return new BCryptPasswordEncoder(12);
     }
+
     @Bean
-    public RestTemplate restTemplate() {
-        return new RestTemplate();
+    public RestClient.Builder restClientBuilder() {
+        return RestClient.builder();
     }
 }
