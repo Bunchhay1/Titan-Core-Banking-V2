@@ -9,7 +9,7 @@ public class VipFeeStrategy implements FeeStrategy {
 
     @Override
     public BigDecimal calculateFee(BigDecimal amount) {
-        return BigDecimal.ZERO; // Free for VIPs!
+        return BigDecimal.ZERO.setScale(4, java.math.RoundingMode.HALF_EVEN); // Free for VIPs!
     }
 
     @Override
