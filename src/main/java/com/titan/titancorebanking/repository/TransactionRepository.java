@@ -6,6 +6,8 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 
@@ -19,13 +21,28 @@ public interface TransactionRepository extends JpaRepository<Transaction, Long> 
     Optional<Transaction> findByTransactionReference(String transactionReference);
 
     @Query("""
-        SELECT t FROM Transaction t 
-        LEFT JOIN FETCH t.fromAccount fa 
-        LEFT JOIN FETCH t.toAccount ta 
-        WHERE (fa.user.username = :username OR ta.user.username = :username) 
+        SELECT t FROM Transaction t
+        LEFT JOIN FETCH t.fromAccount fa
+        LEFT JOIN FETCH t.toAccount ta
+        WHERE (fa.user.username = :username OR ta.user.username = :username)
         ORDER BY t.timestamp DESC
     """)
     List<Transaction> findAllByUser(@Param("username") String username);
+
+    /**
+     * Returns the single most-recent transaction for a user without loading the full history.
+     * Replaces the previous pattern of calling {@code findAllByUser()} and taking the last
+     * element, which caused an O(N) unbounded read for high-volume users.
+     */
+    @Query("""
+        SELECT t FROM Transaction t
+        LEFT JOIN FETCH t.fromAccount fa
+        LEFT JOIN FETCH t.toAccount ta
+        WHERE (fa.user.username = :username OR ta.user.username = :username)
+        ORDER BY t.timestamp DESC
+        LIMIT 1
+    """)
+    Optional<Transaction> findLatestByUser(@Param("username") String username);
 
     @Query("""
         SELECT t FROM Transaction t 
@@ -35,5 +52,47 @@ public interface TransactionRepository extends JpaRepository<Transaction, Long> 
     List<Transaction> findTop10ByFromAccountIdOrToAccountIdOrderByTimestampDesc(
             @Param("accountId") Long fromAccountId,
             @Param("accountId") Long toAccountId
+    );
+
+    /**
+     * Sums the total amount transferred OUT from a given account since a given timestamp.
+     * Used by the daily transfer limit guard in TransactionService.
+     * Only counts SUCCESS and PROCESSING statuses to avoid penalising failed attempts.
+     */
+    @Query("""
+        SELECT COALESCE(SUM(t.amount), 0)
+        FROM Transaction t
+        WHERE t.fromAccount.id = :accountId
+          AND t.transactionType = com.titan.titancorebanking.enums.TransactionType.TRANSFER
+          AND t.status IN (
+                com.titan.titancorebanking.enums.TransactionStatus.SUCCESS,
+                com.titan.titancorebanking.enums.TransactionStatus.PROCESSING
+              )
+          AND t.timestamp >= :since
+    """)
+    BigDecimal sumOutboundTransfersSince(
+            @Param("accountId") Long accountId,
+            @Param("since") LocalDateTime since
+    );
+
+    /**
+     * Sums the total amount withdrawn from a given account since a given timestamp.
+     * Used by the daily withdrawal limit guard in TransactionService.
+     * Only counts SUCCESS and PROCESSING statuses to avoid penalising failed attempts.
+     */
+    @Query("""
+        SELECT COALESCE(SUM(t.amount), 0)
+        FROM Transaction t
+        WHERE t.fromAccount.id = :accountId
+          AND t.transactionType = com.titan.titancorebanking.enums.TransactionType.WITHDRAWAL
+          AND t.status IN (
+                com.titan.titancorebanking.enums.TransactionStatus.SUCCESS,
+                com.titan.titancorebanking.enums.TransactionStatus.PROCESSING
+              )
+          AND t.timestamp >= :since
+    """)
+    BigDecimal sumOutboundWithdrawalsSince(
+            @Param("accountId") Long accountId,
+            @Param("since") LocalDateTime since
     );
 }
