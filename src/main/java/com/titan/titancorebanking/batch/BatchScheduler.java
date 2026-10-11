@@ -33,8 +33,8 @@ import java.util.UUID;
 @Slf4j
 public class BatchScheduler {
 
-    private static final BigDecimal SAVINGS_APY = new BigDecimal("0.05");  // 5% APY
-    private static final BigDecimal CHECKING_APY = new BigDecimal("0.01"); // 1% APY
+    private static final BigDecimal SAVINGS_APY = new BigDecimal("0.05");
+    private static final BigDecimal CHECKING_APY = new BigDecimal("0.01");
     private static final BigDecimal DAYS_IN_YEAR = new BigDecimal("365");
     private static final int PAGE_SIZE = 500;
     private static final String GL_ACCOUNT_NUMBER = "GL-INTEREST-EXPENSE";
@@ -44,63 +44,56 @@ public class BatchScheduler {
     private final LedgerRepository ledgerRepository;
     private final UserRepository userRepository;
 
-    /**
-     * Daily interest calculation running at midnight off-peak hours (Asia/Phnom_Penh).
-     * Processes eligible accounts in paginated batches with deterministic locking and balanced Double-Entry Ledger records.
-     */
     @Scheduled(cron = "${banking.scheduler.interest-cron:0 0 0 * * ?}", zone = "Asia/Phnom_Penh")
     public void runInterestCalculationJob() {
-        log.info("🚀 [BatchScheduler] Starting Daily Interest Calculation Batch...");
+        log.info("  [BatchScheduler] Starting Daily Interest Calculation Batch...");
         long startTime = System.currentTimeMillis();
-        int pageNumber = 0;
+
         int processedCount = 0;
         int interestAppliedCount = 0;
+        Long lastProcessedId = 0L;
 
         try {
-            // Ensure Bank's General Ledger Interest Expense Account is resolved
             Account glAccount = getOrCreateInterestExpenseGlAccount();
-
             Page<Account> accountPage;
+
+            // Use keyset pagination (seek method) instead of offset pagination to prevent missed
+            // records during concurrent modifications and provide safe resumption points.
             do {
-                accountPage = accountRepository.findAll(
-                        PageRequest.of(pageNumber, PAGE_SIZE, Sort.by("id").ascending())
+                accountPage = accountRepository.findByIdGreaterThanOrderByIdAsc(
+                        lastProcessedId,
+                        PageRequest.of(0, PAGE_SIZE)
                 );
 
                 for (Account account : accountPage.getContent()) {
+                    lastProcessedId = account.getId();
                     processedCount++;
-                    // Skip GL account itself or non-positive balances
+
                     if (account.getId().equals(glAccount.getId()) ||
                             account.getBalance() == null ||
                             account.getBalance().compareTo(BigDecimal.ZERO) <= 0) {
                         continue;
                     }
 
-                    boolean applied = processInterestForAccount(account.getId(), glAccount.getId());
+                    boolean applied = processInterestForAccountSafe(account.getId(), glAccount.getId());
                     if (applied) {
                         interestAppliedCount++;
                     }
                 }
-
-                pageNumber++;
             } while (accountPage.hasNext());
 
             long duration = System.currentTimeMillis() - startTime;
-            log.info("✅ [BatchScheduler] Interest Batch Finished in {} ms. Processed: {} accounts, Interest Applied: {}",
+            log.info("  [BatchScheduler] Interest Batch Finished in {} ms. Processed: {} accounts, Interest Applied: {}",
                     duration, processedCount, interestAppliedCount);
 
         } catch (Exception e) {
-            log.error("❌ [BatchScheduler] Daily Interest Batch failed: ", e);
+            log.error("  [BatchScheduler] Daily Interest Batch failed catastrophically at ID {}: ", lastProcessedId, e);
         }
     }
 
-    /**
-     * Processes individual account interest payout in an isolated transaction
-     * with deterministic row locking (min(id) -> max(id)) and Double-Entry Ledger persistence.
-     */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public boolean processInterestForAccount(Long customerAccountId, Long glAccountId) {
+    public boolean processInterestForAccountSafe(Long customerAccountId, Long glAccountId) {
         try {
-            // 1️⃣ Acquire deterministic pessimistic locks (min(id) -> max(id))
             Long firstId = Math.min(customerAccountId, glAccountId);
             Long secondId = Math.max(customerAccountId, glAccountId);
 
@@ -116,7 +109,6 @@ public class BatchScheduler {
                 return false;
             }
 
-            // 2️⃣ Calculate interest using Bankers' Rounding (HALF_EVEN)
             BigDecimal apy = (customerLocked.getAccountType() == AccountType.SAVINGS) ? SAVINGS_APY : CHECKING_APY;
             BigDecimal dailyInterest = customerLocked.getBalance()
                     .multiply(apy)
@@ -126,29 +118,33 @@ public class BatchScheduler {
                 return false;
             }
 
-            // 3️⃣ Update balances
             glLocked.setBalance(glLocked.getBalance().subtract(dailyInterest));
             customerLocked.setBalance(customerLocked.getBalance().add(dailyInterest));
+
             accountRepository.save(glLocked);
             accountRepository.save(customerLocked);
 
             LocalDateTime now = LocalDateTime.now();
+            String idempotencyKey = "INT-" + now.toLocalDate() + "-" + customerLocked.getId();
 
-            // 4️⃣ Create Transaction Audit record
+            // Prevent duplicate interest payouts if the batch restarts
+            if (transactionRepository.findByIdempotencyKey(idempotencyKey).isPresent()) {
+                return false;
+            }
+
             Transaction tx = Transaction.builder()
                     .fromAccount(glLocked)
                     .toAccount(customerLocked)
                     .amount(dailyInterest)
                     .transactionType(TransactionType.INTEREST)
                     .status(TransactionStatus.SUCCESS)
-                    .note("Daily Interest Payout (" + (customerLocked.getAccountType() != null ? customerLocked.getAccountType() : "SAVINGS") + ")")
+                    .note("Daily Interest Payout")
                     .timestamp(now)
                     .transactionReference("INT-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase())
+                    .idempotencyKey(idempotencyKey)
                     .build();
             transactionRepository.save(tx);
 
-            // 5️⃣ Persist Balanced Double-Entry Ledger:
-            // 1) DEBIT Bank's Interest Expense GL Account
             LedgerEntry debitGlEntry = LedgerEntry.builder()
                     .transactionId(tx.getId())
                     .accountId(glLocked.getId())
@@ -159,7 +155,6 @@ public class BatchScheduler {
                     .createdBy("SYSTEM_BATCH_INTEREST")
                     .build();
 
-            // 2) CREDIT Customer's Deposit Account
             LedgerEntry creditCustomerEntry = LedgerEntry.builder()
                     .transactionId(tx.getId())
                     .accountId(customerLocked.getId())
@@ -173,10 +168,8 @@ public class BatchScheduler {
             ledgerRepository.save(debitGlEntry);
             ledgerRepository.save(creditCustomerEntry);
 
-            log.debug("💰 [Interest Applied] Account: {} | Payout: {} | Tx: {}",
-                    customerLocked.getAccountNumber(), dailyInterest, tx.getTransactionReference());
-
             return true;
+
         } catch (Exception e) {
             log.error("Failed to apply interest for account ID {}: {}", customerAccountId, e.getMessage());
             return false;
@@ -185,8 +178,8 @@ public class BatchScheduler {
 
     private Account getOrCreateInterestExpenseGlAccount() {
         return accountRepository.findByAccountNumber(GL_ACCOUNT_NUMBER)
-                .orElseGet(() -> accountRepository.findById(1L).orElseGet(() -> {
-                    User systemUser = userRepository.findAll().stream().findFirst().orElseGet(() -> {
+                .orElseGet(() -> {
+                    User systemUser = userRepository.findByUsername("system_treasury").orElseGet(() -> {
                         User user = User.builder()
                                 .username("system_treasury")
                                 .password("System@123456")
@@ -205,6 +198,6 @@ public class BatchScheduler {
                             .createdAt(LocalDateTime.now())
                             .build();
                     return accountRepository.save(gl);
-                }));
+                });
     }
 }
