@@ -1,35 +1,49 @@
 package com.titan.titancorebanking.dto.request;
 
-import jakarta.validation.constraints.*;
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 import java.math.BigDecimal;
 
 /**
- * ✅ JAVA 21: Immutable Record (No Lombok needed)
- * Automatically generates: constructor, getters, equals, hashCode, toString
+ * Immutable Transaction Request Record.
+ * Utilizes Jakarta Validation to enforce strict payload constraints before reaching the service layer.
  */
 public record TransactionRequest(
-    @Pattern(regexp = "^[0-9]{10,16}$", message = "Invalid account number format")
-    String fromAccountNumber,
+        @NotBlank(message = "Source account number cannot be empty")
+        String fromAccountNumber,
 
-    @Pattern(regexp = "^[0-9]{10,16}$", message = "Invalid account number format")
-    String toAccountNumber,
+        String toAccountNumber,
 
-    @NotNull(message = "Amount is required")
-    @DecimalMin(value = "0.01", message = "Amount must be greater than 0")
-    @DecimalMax(value = "1000000.00", message = "Amount exceeds maximum limit")
-    @Digits(integer = 10, fraction = 2, message = "Invalid amount format")
-    BigDecimal amount,
+        @NotNull(message = "Amount is required")
+        @DecimalMin(value = "0.01", message = "Amount must be greater than zero")
+        BigDecimal amount,
 
-    @Size(min = 4, max = 6, message = "PIN must be 4-6 digits")
-    @Pattern(regexp = "^[0-9]+$", message = "PIN must contain only digits")
-    String pin,
+        String pin,
 
-    @Size(max = 255, message = "Note cannot exceed 255 characters")
-    String note,
+        String note,
 
-    String otpCode,
-    String transactionType,
-    String idempotencyKey,
-    String swiftCode,
-    String iban
-) {}
+        String swiftCode,
+
+        String iban,
+
+        // Used internally for withIdempotencyKey copying
+        String idempotencyKey
+) {
+    /**
+     * Wither method to safely enrich the immutable record with an idempotency key
+     * extracted from HTTP headers in the controller layer.
+     */
+    public TransactionRequest withIdempotencyKey(String idempotencyKey) {
+        return new TransactionRequest(
+                this.fromAccountNumber,
+                this.toAccountNumber,
+                this.amount,
+                this.pin,
+                this.note,
+                this.swiftCode,
+                this.iban,
+                idempotencyKey
+        );
+    }
+}
