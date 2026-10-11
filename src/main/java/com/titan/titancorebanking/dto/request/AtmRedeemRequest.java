@@ -1,21 +1,17 @@
 package com.titan.titancorebanking.dto.request;
 
-import jakarta.validation.constraints.*;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 
 /**
- * Request body for POST /api/v1/atm/redeem
- *
- * The ATM terminal presents the 12-digit code entered by the customer.
- * Optionally includes the terminal ID for audit trails.
+ * Immutable ATM Redemption Request.
+ * Used by the ATM terminal to redeem the 12-digit code[cite: 1].
  */
 public record AtmRedeemRequest(
+        @NotBlank(message = "ATM code is required")
+        @Pattern(regexp = "^\\d{12}$", message = "ATM code must be exactly 12 digits")
+        String code,
 
-    @NotBlank(message = "ATM code is required")
-    @Size(min = 12, max = 12, message = "ATM code must be exactly 12 digits")
-    @Pattern(regexp = "^[0-9]{12}$", message = "ATM code must contain only digits")
-    String code,
-
-    /** ATM terminal identifier – optional but useful for fraud investigation. */
-    @Size(max = 50, message = "Terminal ID must not exceed 50 characters")
-    String terminalId
+        @NotBlank(message = "Terminal ID is required for audit tracing")
+        String terminalId
 ) {}
