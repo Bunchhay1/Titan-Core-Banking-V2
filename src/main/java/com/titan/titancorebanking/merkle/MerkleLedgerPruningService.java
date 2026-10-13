@@ -5,9 +5,11 @@ import com.titan.titancorebanking.repository.LedgerRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Slice;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.annotation.Transactional;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
@@ -20,10 +22,6 @@ import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 
-/**
- * Task 5: Cryptographic Merkle Tree Ledger Pruning
- * Fixed Spring AOP Proxy bypass by utilizing TransactionTemplate for explicit batch commits.
- */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -32,7 +30,6 @@ public class MerkleLedgerPruningService {
     private final LedgerRepository ledgerRepository;
     private final MerkleArchiveRepository merkleArchiveRepository;
     private final S3Client s3Client;
-    private final TransactionTemplate transactionTemplate;
 
     @Value("${merkle.archive.bucket:titan-ledger-glacier}")
     private String glacierBucket;
@@ -40,8 +37,7 @@ public class MerkleLedgerPruningService {
     @Value("${merkle.prune.days-old:90}")
     private int daysOld;
 
-    @Value("${merkle.batch.size:1000}")
-    private int batchSize;
+    private static final int BATCH_SIZE = 1000;
 
     @Scheduled(cron = "0 0 2 1 * *")
     public void pruneAndArchive() {
@@ -49,32 +45,29 @@ public class MerkleLedgerPruningService {
         log.info("Starting Merkle ledger pruning for entries before {}", cutoff);
 
         int totalPruned = 0;
-        boolean hasMore = true;
+        Slice<LedgerEntry> batchSlice;
 
-        while (hasMore) {
-            hasMore = Boolean.TRUE.equals(transactionTemplate.execute(status -> {
-                List<LedgerEntry> batch = ledgerRepository.findOlderThan(cutoff, batchSize);
-                if (batch.isEmpty()) {
-                    return false;
-                }
+        do {
+            // STAFF ENGINEER FIX: Memory-safe chunked retrieval
+            batchSlice = ledgerRepository.findOlderThan(cutoff, PageRequest.of(0, BATCH_SIZE));
+            List<LedgerEntry> batch = batchSlice.getContent();
 
-                String merkleRoot = buildMerkleRoot(batch);
-                String archiveKey = archiveToGlacier(batch, merkleRoot, cutoff);
+            if (batch.isEmpty()) break;
 
-                saveMerkleRecord(merkleRoot, archiveKey, batch.size(),
-                        batch.getFirst().getId(), batch.getLast().getId());
+            String merkleRoot = buildMerkleRoot(batch);
+            String archiveKey = archiveToGlacier(batch, merkleRoot, cutoff);
 
-                ledgerRepository.deleteAll(batch);
-                log.info("Pruned batch of {} entries, merkleRoot={}", batch.size(), merkleRoot);
+            saveMerkleRecord(merkleRoot, archiveKey, batch.size(),
+                    batch.get(0).getId(), batch.get(batch.size() - 1).getId());
 
-                return batch.size() == batchSize;
-            }));
+            pruneEntries(batch);
+            totalPruned += batch.size();
 
-            if (hasMore) {
-                totalPruned += batchSize;
-            }
-        }
-        log.info("  Merkle pruning complete. Total pruned: {}", totalPruned);
+            log.info("Pruned batch of {} entries, merkleRoot={}", batch.size(), merkleRoot);
+
+        } while (batchSlice.hasNext());
+
+        log.info("Merkle pruning complete. Total pruned: {}", totalPruned);
     }
 
     public String buildMerkleRoot(List<LedgerEntry> entries) {
@@ -94,16 +87,7 @@ public class MerkleLedgerPruningService {
             }
             hashes = nextLevel;
         }
-        return hashes.getFirst();
-    }
-
-    public boolean verifyEntry(LedgerEntry entry, String expectedRoot, List<String> proofPath, List<Boolean> isLeft) {
-        String hash = sha256(canonicalize(entry));
-        for (int i = 0; i < proofPath.size(); i++) {
-            String sibling = proofPath.get(i);
-            hash = isLeft.get(i) ? sha256(hash + sibling) : sha256(sibling + hash);
-        }
-        return hash.equals(expectedRoot);
+        return hashes.get(0);
     }
 
     private String archiveToGlacier(List<LedgerEntry> entries, String merkleRoot, LocalDateTime cutoff) {
@@ -128,8 +112,12 @@ public class MerkleLedgerPruningService {
                         .build(),
                 RequestBody.fromString(sb.toString())
         );
-
         return key;
+    }
+
+    @Transactional
+    protected void pruneEntries(List<LedgerEntry> entries) {
+        ledgerRepository.deleteAllInBatch(entries); // Optimized batch delete
     }
 
     private void saveMerkleRecord(String root, String archiveKey, int count, Long firstId, Long lastId) {
