@@ -3,23 +3,19 @@ package com.titan.titancorebanking.service.imple;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.SignatureAlgorithm;
-import io.jsonwebtoken.io.Decoders;
 import io.jsonwebtoken.security.Keys;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PostConstruct;
+import java.nio.charset.StandardCharsets;
 import java.security.Key;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Function;
 
-/**
- * Hardened JWT Service.
- * Upgraded from raw UTF-8 string bytes to strict Base64 decoding for the HMAC-SHA256 key.
- * This guarantees a cryptographically secure 256-bit entropy baseline.
- */
 @Service
 public class JwtService {
 
@@ -34,6 +30,17 @@ public class JwtService {
 
     @Value("${app.jwt.audience:titan-api}")
     private String jwtAudience;
+
+    private Key signingKey;
+
+    @PostConstruct
+    public void init() {
+        byte[] keyBytes = secretKey.getBytes(StandardCharsets.UTF_8);
+        if (keyBytes.length < 32) {
+            throw new IllegalStateException("JWT Secret Key must be at least 256 bits (32 characters) for HS256");
+        }
+        this.signingKey = Keys.hmacShaKeyFor(keyBytes);
+    }
 
     public String extractUsername(String token) {
         return extractClaim(token, Claims::getSubject);
@@ -50,6 +57,7 @@ public class JwtService {
 
     public String generateToken(Map<String, Object> extraClaims, UserDetails userDetails) {
         Map<String, Object> claims = new HashMap<>(extraClaims);
+
         if (jwtIssuer != null && !jwtIssuer.isBlank()) {
             claims.putIfAbsent("iss", jwtIssuer);
         }
@@ -57,12 +65,14 @@ public class JwtService {
             claims.putIfAbsent("aud", jwtAudience);
         }
 
+        long now = System.currentTimeMillis();
+
         return Jwts.builder()
                 .setClaims(claims)
                 .setSubject(userDetails.getUsername())
-                .setIssuedAt(new Date(System.currentTimeMillis()))
-                .setExpiration(new Date(System.currentTimeMillis() + jwtExpiration))
-                .signWith(getSignInKey(), SignatureAlgorithm.HS256)
+                .setIssuedAt(new Date(now))
+                .setExpiration(new Date(now + jwtExpiration))
+                .signWith(signingKey, SignatureAlgorithm.HS256)
                 .compact();
     }
 
@@ -80,17 +90,10 @@ public class JwtService {
     }
 
     private Claims extractAllClaims(String token) {
-        return Jwts
-                .parserBuilder()
-                .setSigningKey(getSignInKey())
+        return Jwts.parserBuilder()
+                .setSigningKey(signingKey)
                 .build()
                 .parseClaimsJws(token)
                 .getBody();
-    }
-
-    private Key getSignInKey() {
-        // Enforce Base64 decoding for strict cryptographic entropy
-        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
-        return Keys.hmacShaKeyFor(keyBytes);
     }
 }
