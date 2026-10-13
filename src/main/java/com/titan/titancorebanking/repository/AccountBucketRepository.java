@@ -19,6 +19,11 @@ public interface AccountBucketRepository extends JpaRepository<AccountBucket, Lo
 
     List<AccountBucket> findByParentAccountId(Long parentAccountId);
 
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000")})
+    @Query("SELECT b FROM AccountBucket b WHERE b.parentAccount.id = :parentAccountId ORDER BY b.bucketIndex ASC")
+    List<AccountBucket> findByParentAccountIdWithLock(@Param("parentAccountId") Long parentAccountId);
+
     @Query("SELECT DISTINCT a.parentAccount.id FROM AccountBucket a WHERE a.balance > 0")
     List<Long> findDistinctParentAccountIds();
 
@@ -41,4 +46,21 @@ public interface AccountBucketRepository extends JpaRepository<AccountBucket, Lo
 
     @Query("SELECT SUM(b.balance) FROM AccountBucket b WHERE b.parentAccount.id = :parentAccountId")
     BigDecimal sumBucketBalancesByParentAccountId(@Param("parentAccountId") Long parentAccountId);
+
+    /**
+     * Atomically inserts a bucket row with ON CONFLICT DO NOTHING.
+     * Prevents unique constraint race conditions under concurrent initializations.
+     */
+    @org.springframework.data.jpa.repository.Modifying
+    @org.springframework.transaction.annotation.Transactional
+    @Query(value = """
+        INSERT INTO account_buckets (parent_account_id, bucket_index, balance, currency, updated_at)
+        VALUES (:parentAccountId, :bucketIndex, 0.00, :currency, NOW())
+        ON CONFLICT (parent_account_id, bucket_index) DO NOTHING
+    """, nativeQuery = true)
+    void insertBucketIfNotExists(
+            @Param("parentAccountId") Long parentAccountId,
+            @Param("bucketIndex") int bucketIndex,
+            @Param("currency") String currency
+    );
 }
