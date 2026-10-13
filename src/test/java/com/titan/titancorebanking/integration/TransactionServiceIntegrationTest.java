@@ -12,9 +12,11 @@ import com.titan.titancorebanking.exception.DailyLimitExceededException;
 import com.titan.titancorebanking.exception.InsufficientBalanceException;
 import com.titan.titancorebanking.exception.InvalidPinException;
 import com.titan.titancorebanking.failsafe.DeadMansSwitchService;
+import com.titan.titancorebanking.dto.response.TransactionResponse;
 import com.titan.titancorebanking.model.Account;
 import com.titan.titancorebanking.model.Transaction;
 import com.titan.titancorebanking.model.User;
+import com.titan.titancorebanking.repository.AccountBucketRepository;
 import com.titan.titancorebanking.repository.AccountRepository;
 import com.titan.titancorebanking.repository.TransactionRepository;
 import com.titan.titancorebanking.repository.UserRepository;
@@ -30,8 +32,15 @@ import org.junit.jupiter.api.Timeout;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.authentication.AnonymousAuthenticationToken;
+import org.springframework.security.authentication.AuthenticationCredentialsNotFoundException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.core.authority.AuthorityUtils;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -51,6 +60,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -172,6 +182,9 @@ class TransactionServiceIntegrationTest {
     private TransactionRepository transactionRepository;
 
     @Autowired
+    private AccountBucketRepository accountBucketRepository;
+
+    @Autowired
     private PasswordEncoder passwordEncoder;
 
     @Autowired
@@ -220,6 +233,7 @@ class TransactionServiceIntegrationTest {
     private User alice;
     private User bob;
     private User charlie;
+    private User operator;
     private Account aliceAccount;
     private Account bobAccount;
     private Account charlieAccount;
@@ -283,6 +297,32 @@ class TransactionServiceIntegrationTest {
                 .accountNonLocked(true)
                 .build());
 
+        operator = userRepository.save(User.builder()
+                .firstName("Operator").lastName("Titan")
+                .username("operator_test").email("operator@titan.test")
+                .password(hashedPassword).pin(hashedPin)
+                .role("ROLE_OPERATOR").tier(UserTier.VIP)
+                .accountNonLocked(true)
+                .build());
+
+        User systemBank = userRepository.save(User.builder()
+                .firstName("Titan").lastName("System")
+                .username("SYSTEM_BANK").email("system@titanbank.com")
+                .password(hashedPassword).pin(hashedPin)
+                .role("ROLE_ADMIN").tier(UserTier.VIP)
+                .accountNonLocked(true)
+                .build());
+
+        accountRepository.save(Account.builder()
+                .accountNumber("BANK-FEE-REVENUE")
+                .accountType(AccountType.SAVINGS)
+                .currency(Currency.USD)
+                .balance(BigDecimal.ZERO)
+                .overdraftLimit(BigDecimal.ZERO)
+                .status(AccountStatus.ACTIVE)
+                .user(systemBank)
+                .build());
+
         aliceAccount = accountRepository.save(Account.builder()
                 .accountNumber("ACC-ALICE-001")
                 .accountType(AccountType.SAVINGS)
@@ -341,6 +381,8 @@ class TransactionServiceIntegrationTest {
         // under the 50-thread concurrency test. This is test-only synchronization;
         // the real implementation uses PostgreSQL row locks instead.
         when(accountBucketService.selectRandomBucketIndex()).thenReturn(0);
+        when(accountBucketService.calculateTotalAggregatedBalance(anyLong(), any(BigDecimal.class)))
+                .thenAnswer(inv -> inv.getArgument(1));
         doAnswer(invocation -> {
             Long parentAccountId = invocation.getArgument(0);
             BigDecimal amount    = invocation.getArgument(2);
@@ -404,15 +446,15 @@ class TransactionServiceIntegrationTest {
                 null, null, null
         );
 
-        Transaction result = transactionService.transfer(request, alice.getUsername());
+        TransactionResponse result = transactionService.transfer(request, alice.getUsername());
 
         // Assert transaction record
         assertThat(result).isNotNull();
-        assertThat(result.getId()).isPositive();
-        assertThat(result.getStatus()).isEqualTo(TransactionStatus.SUCCESS);
-        assertThat(result.getTransactionType()).isEqualTo(TransactionType.TRANSFER);
-        assertThat(result.getAmount()).isEqualByComparingTo(transferAmount);
-        assertThat(result.getTransactionReference()).startsWith("TX-");
+        assertThat(result.id()).isPositive();
+        assertThat(result.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        assertThat(result.type()).isEqualTo(TransactionType.TRANSFER.name());
+        assertThat(result.amount()).isEqualByComparingTo(transferAmount);
+        assertThat(result.transactionReference()).startsWith("TX-");
 
         // Assert sender balance: reduced by amount + fee
         Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
@@ -427,7 +469,7 @@ class TransactionServiceIntegrationTest {
                 .isEqualByComparingTo(bobInitial.add(transferAmount));
 
         // Assert exactly one transaction was persisted
-        assertThat(transactionRepository.findById(result.getId())).isPresent();
+        assertThat(transactionRepository.findById(result.id())).isPresent();
     }
 
     // ── 2. Deadlock Prevention — Concurrent Bidirectional Transfers ──────────
@@ -590,20 +632,20 @@ class TransactionServiceIntegrationTest {
         );
 
         // First submission — should execute normally
-        Transaction firstResult = transactionService.transfer(firstRequest, alice.getUsername());
+        TransactionResponse firstResult = transactionService.transfer(firstRequest, alice.getUsername());
         assertThat(firstResult).isNotNull();
-        assertThat(firstResult.getStatus()).isEqualTo(TransactionStatus.SUCCESS);
+        assertThat(firstResult.status()).isEqualTo(TransactionStatus.SUCCESS.name());
 
         BigDecimal aliceBalanceAfterFirst =
                 accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow().getBalance();
 
         // Second submission — identical key, must be a no-op
-        Transaction secondResult = transactionService.transfer(firstRequest, alice.getUsername());
+        TransactionResponse secondResult = transactionService.transfer(firstRequest, alice.getUsername());
 
         // Same Transaction ID — proof no new record was created
-        assertThat(secondResult.getId())
+        assertThat(secondResult.id())
                 .as("Idempotency: second call must return the SAME transaction ID as the first call")
-                .isEqualTo(firstResult.getId());
+                .isEqualTo(firstResult.id());
 
         // Balance must not have changed after the deduplicated (no-op) call
         BigDecimal aliceBalanceAfterSecond =
@@ -694,8 +736,8 @@ class TransactionServiceIntegrationTest {
         );
 
         assertThatThrownBy(() -> transactionService.transfer(request, charlie.getUsername()))
-                .as("Transferring from another user's account must throw SecurityException (IDOR guard)")
-                .isInstanceOf(SecurityException.class)
+                .as("Transferring from another user's account must throw AccessDeniedException (IDOR guard)")
+                .isInstanceOf(AccessDeniedException.class)
                 .hasMessageContaining("do not own");
 
         // Neither balance should change
@@ -823,16 +865,16 @@ class TransactionServiceIntegrationTest {
      * only) which is the standard deposit call pattern from the controller.
      */
     @Test
-    @DisplayName("deposit_happyPath — balance increases by deposit amount, type=DEPOSIT, status=SUCCESS")
+    @DisplayName("deposit_happyPath — owner deposits to own account, balance increases, type=DEPOSIT, status=SUCCESS")
     void deposit_happyPath() {
+        setSecurityContext(bob);
         BigDecimal depositAmount = new BigDecimal("500.00");
         BigDecimal balanceBefore = bobAccount.getBalance();
 
         // deposit() uses toAccountNumber if non-null; falls back to fromAccountNumber.
-        // Passing as fromAccountNumber (null toAccountNumber) tests the fallback path
-        // that the TransactionController uses for operator-initiated deposits.
+        // Passing as fromAccountNumber (null toAccountNumber) tests the fallback path.
         TransactionRequest request = new TransactionRequest(
-                bobAccount.getAccountNumber(), // target account via fallback path
+                bobAccount.getAccountNumber(),
                 null,
                 depositAmount,
                 null,  // No PIN required for deposits
@@ -840,17 +882,100 @@ class TransactionServiceIntegrationTest {
                 null, null, null
         );
 
-        Transaction result = transactionService.deposit(request);
+        TransactionResponse result = transactionService.deposit(request);
 
         assertThat(result).isNotNull();
-        assertThat(result.getStatus()).isEqualTo(TransactionStatus.SUCCESS);
-        assertThat(result.getTransactionType()).isEqualTo(TransactionType.DEPOSIT);
-        assertThat(result.getAmount()).isEqualByComparingTo(depositAmount);
+        assertThat(result.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        assertThat(result.type()).isEqualTo(TransactionType.DEPOSIT.name());
+        assertThat(result.amount()).isEqualByComparingTo(depositAmount);
 
         Account refreshedBob = accountRepository.findByAccountNumber(bobAccount.getAccountNumber()).orElseThrow();
         assertThat(refreshedBob.getBalance())
                 .as("Balance must increase by exactly the deposit amount (no fee on deposits)")
                 .isEqualByComparingTo(balanceBefore.add(depositAmount));
+    }
+
+    @Test
+    @DisplayName("deposit_operatorInitiated_happyPath — authorized operator deposits into customer account")
+    void deposit_operatorInitiated_happyPath() {
+        setSecurityContext(operator);
+        BigDecimal depositAmount = new BigDecimal("750.00");
+        BigDecimal balanceBefore = bobAccount.getBalance();
+
+        TransactionRequest request = new TransactionRequest(
+                null,
+                bobAccount.getAccountNumber(),
+                depositAmount,
+                null,
+                "Operator cash deposit",
+                null, null, null
+        );
+
+        TransactionResponse result = transactionService.deposit(request);
+
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        Account refreshedBob = accountRepository.findByAccountNumber(bobAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedBob.getBalance()).isEqualByComparingTo(balanceBefore.add(depositAmount));
+    }
+
+    @Test
+    @DisplayName("deposit_unauthorizedCrossAccount_throwsAccessDeniedException — non-owner non-operator rejected")
+    void deposit_unauthorizedCrossAccount_throwsAccessDeniedException() {
+        setSecurityContext(alice);
+        TransactionRequest request = new TransactionRequest(
+                bobAccount.getAccountNumber(),
+                null,
+                new BigDecimal("100.00"),
+                null,
+                "Unauthorized deposit attempt",
+                null, null, null
+        );
+
+        assertThatThrownBy(() -> transactionService.deposit(request))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("You do not own this account and are not an authorized operator");
+    }
+
+    @Test
+    @DisplayName("deposit_unauthenticated_throwsAuthenticationCredentialsNotFoundException — unauthenticated caller rejected")
+    void deposit_unauthenticated_throwsAuthenticationCredentialsNotFoundException() {
+        SecurityContextHolder.clearContext();
+        TransactionRequest request = new TransactionRequest(
+                bobAccount.getAccountNumber(),
+                null,
+                new BigDecimal("100.00"),
+                null,
+                "Unauthenticated deposit",
+                null, null, null
+        );
+
+        assertThatThrownBy(() -> transactionService.deposit(request))
+                .isInstanceOf(AuthenticationCredentialsNotFoundException.class)
+                .hasMessageContaining("Full authentication is required");
+    }
+
+    @Test
+    @DisplayName("depositInternal_systemTrusted_happyPath — trusted system caller executes deposit")
+    void depositInternal_systemTrusted_happyPath() {
+        BigDecimal depositAmount = new BigDecimal("250.00");
+        BigDecimal balanceBefore = bobAccount.getBalance();
+
+        TransactionRequest request = new TransactionRequest(
+                bobAccount.getAccountNumber(),
+                null,
+                depositAmount,
+                null,
+                "Batch interest credit",
+                null, null, null
+        );
+
+        TransactionResponse result = transactionService.depositInternal(request, "SYSTEM_BATCH_INTEREST");
+
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        Account refreshedBob = accountRepository.findByAccountNumber(bobAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedBob.getBalance()).isEqualByComparingTo(balanceBefore.add(depositAmount));
     }
 
     // ── 9. Withdraw — Happy Path ──────────────────────────────────────────────
@@ -877,12 +1002,12 @@ class TransactionServiceIntegrationTest {
                 null, null, null
         );
 
-        Transaction result = transactionService.withdraw(request, alice.getUsername());
+        TransactionResponse result = transactionService.withdraw(request, alice.getUsername());
 
         assertThat(result).isNotNull();
-        assertThat(result.getStatus()).isEqualTo(TransactionStatus.SUCCESS);
-        assertThat(result.getTransactionType()).isEqualTo(TransactionType.WITHDRAWAL);
-        assertThat(result.getAmount()).isEqualByComparingTo(withdrawAmount);
+        assertThat(result.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        assertThat(result.type()).isEqualTo(TransactionType.WITHDRAWAL.name());
+        assertThat(result.amount()).isEqualByComparingTo(withdrawAmount);
 
         Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
         assertThat(refreshedAlice.getBalance())
@@ -1044,8 +1169,8 @@ class TransactionServiceIntegrationTest {
         );
 
         assertThatThrownBy(() -> transactionService.withdraw(request, charlie.getUsername()))
-                .as("Withdrawing from another user's account must throw SecurityException")
-                .isInstanceOf(SecurityException.class)
+                .as("Withdrawing from another user's account must throw AccessDeniedException")
+                .isInstanceOf(AccessDeniedException.class)
                 .hasMessageContaining("do not own");
 
         Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
@@ -1055,7 +1180,7 @@ class TransactionServiceIntegrationTest {
     // ── 16. Idempotency Replay Authorization (P1-A) ──────────────────────────
 
     @Test
-    @DisplayName("transfer_idempotency_crossUserReplayBlocked — SecurityException thrown on replay by another user")
+    @DisplayName("transfer_idempotency_crossUserReplayBlocked — AccessDeniedException thrown on replay by another user")
     void transfer_idempotency_crossUserReplayBlocked() {
         String idempotencyKey = "idem-cross-" + UUID.randomUUID();
 
@@ -1069,15 +1194,15 @@ class TransactionServiceIntegrationTest {
         );
 
         // Alice executes transfer successfully
-        Transaction originalTx = transactionService.transfer(request, alice.getUsername());
-        assertThat(originalTx.getStatus()).isEqualTo(TransactionStatus.SUCCESS);
+        TransactionResponse originalTx = transactionService.transfer(request, alice.getUsername());
+        assertThat(originalTx.status()).isEqualTo(TransactionStatus.SUCCESS.name());
 
         // Charlie tries to replay using the same idempotency key
         setSecurityContext(charlie);
 
         assertThatThrownBy(() -> transactionService.transfer(request, charlie.getUsername()))
-                .as("Replaying another user's idempotency key must throw SecurityException")
-                .isInstanceOf(SecurityException.class)
+                .as("Replaying another user's idempotency key must throw AccessDeniedException")
+                .isInstanceOf(AccessDeniedException.class)
                 .hasMessageContaining("do not own");
     }
 
@@ -1171,5 +1296,706 @@ class TransactionServiceIntegrationTest {
         static TransactionOutcome deadlock(String error) {
             return new TransactionOutcome(false, null, error);
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // ADDITIONAL GUARDIAN INTEGRATION TESTS
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("withdraw_overdraft_exactAvailableFundsBoundary — withdrawal consuming balance down to exact overdraft limit succeeds")
+    void withdraw_overdraft_exactAvailableFundsBoundary() {
+        setSecurityContext(alice);
+        aliceAccount.setOverdraftLimit(new BigDecimal("1000.0000"));
+        accountRepository.save(aliceAccount);
+
+        BigDecimal exactAvailable = aliceAccount.getBalance().add(aliceAccount.getOverdraftLimit());
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), null, exactAvailable, PLAINTEXT_PIN, "Exact overdraft withdraw", null, null, null);
+
+        TransactionResponse result = transactionService.withdraw(req, alice.getUsername());
+
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedAlice.getBalance()).isEqualByComparingTo(new BigDecimal("-1000.0000"));
+    }
+
+    @Test
+    @DisplayName("withdraw_overdraft_exceedingByOneCent_throwsInsufficientBalance — withdrawal exceeding available limit by 0.01 is rejected")
+    void withdraw_overdraft_exceedingByOneCent_throwsInsufficientBalance() {
+        setSecurityContext(alice);
+        aliceAccount.setOverdraftLimit(new BigDecimal("1000.0000"));
+        accountRepository.save(aliceAccount);
+
+        BigDecimal oneCentOver = aliceAccount.getBalance().add(aliceAccount.getOverdraftLimit()).add(new BigDecimal("0.01"));
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), null, oneCentOver, PLAINTEXT_PIN, "Overdraft + 0.01", null, null, null);
+
+        assertThatThrownBy(() -> transactionService.withdraw(req, alice.getUsername()))
+                .isInstanceOf(InsufficientBalanceException.class)
+                .hasMessageContaining("Insufficient balance");
+
+        Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedAlice.getBalance()).isEqualByComparingTo(new BigDecimal("10000.0000"));
+    }
+
+    @Test
+    @DisplayName("transfer_overdraft_exactAvailableFundsBoundary — transfer consuming balance down to exact overdraft limit succeeds")
+    void transfer_overdraft_exactAvailableFundsBoundary() {
+        // VIP tier has 0.00 fee, simplifying exact boundary calculation
+        alice.setTier(UserTier.VIP);
+        userRepository.save(alice);
+        setSecurityContext(alice);
+
+        aliceAccount.setOverdraftLimit(new BigDecimal("1000.0000"));
+        accountRepository.save(aliceAccount);
+
+        BigDecimal exactAvailable = aliceAccount.getBalance().add(aliceAccount.getOverdraftLimit());
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(), exactAvailable, PLAINTEXT_PIN, "Exact overdraft transfer", null, null, null);
+
+        TransactionResponse result = transactionService.transfer(req, alice.getUsername());
+
+        assertThat(result).isNotNull();
+        assertThat(result.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        Account refreshedBob = accountRepository.findByAccountNumber(bobAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedAlice.getBalance()).isEqualByComparingTo(new BigDecimal("-1000.0000"));
+        assertThat(refreshedBob.getBalance()).isEqualByComparingTo(bobAccount.getBalance().add(exactAvailable));
+    }
+
+    @Test
+    @DisplayName("transfer_overdraft_exceedingByOneCent_throwsInsufficientBalance — transfer exceeding available limit by 0.01 is rejected")
+    void transfer_overdraft_exceedingByOneCent_throwsInsufficientBalance() {
+        alice.setTier(UserTier.VIP);
+        userRepository.save(alice);
+        setSecurityContext(alice);
+
+        aliceAccount.setOverdraftLimit(new BigDecimal("1000.0000"));
+        accountRepository.save(aliceAccount);
+
+        BigDecimal oneCentOver = aliceAccount.getBalance().add(aliceAccount.getOverdraftLimit()).add(new BigDecimal("0.01"));
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(), oneCentOver, PLAINTEXT_PIN, "Overdraft + 0.01 transfer", null, null, null);
+
+        assertThatThrownBy(() -> transactionService.transfer(req, alice.getUsername()))
+                .isInstanceOf(InsufficientBalanceException.class);
+
+        Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        Account refreshedBob = accountRepository.findByAccountNumber(bobAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedAlice.getBalance()).isEqualByComparingTo(new BigDecimal("10000.0000"));
+        assertThat(refreshedBob.getBalance()).isEqualByComparingTo(bobAccount.getBalance());
+    }
+
+    @Test
+    @DisplayName("accountBucket_concurrentFirstTimeCredit_initializationIsIdempotent — concurrent threads initialize buckets without conflict")
+    void accountBucket_concurrentFirstTimeCredit_initializationIsIdempotent() throws Exception {
+        Account freshAccount = accountRepository.save(Account.builder()
+                .accountNumber("ACC-FRESH-001")
+                .accountType(AccountType.SAVINGS)
+                .currency(Currency.USD)
+                .balance(new BigDecimal("1000.0000"))
+                .overdraftLimit(BigDecimal.ZERO)
+                .status(AccountStatus.ACTIVE)
+                .user(charlie)
+                .build());
+
+        assertThat(accountBucketRepository.findByParentAccountId(freshAccount.getId())).isEmpty();
+
+        AccountBucketService realBucketService = new AccountBucketService(accountBucketRepository, accountRepository);
+        int threadCount = 8;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        List<Future<?>> futures = new ArrayList<>();
+
+        for (int i = 0; i < threadCount; i++) {
+            futures.add(executor.submit(() -> realBucketService.getOrInitializeBuckets(freshAccount)));
+        }
+
+        for (Future<?> f : futures) {
+            f.get(10, TimeUnit.SECONDS);
+        }
+        executor.shutdown();
+
+        var buckets = accountBucketRepository.findByParentAccountId(freshAccount.getId());
+        assertThat(buckets).hasSize(AccountBucketService.NUM_BUCKETS);
+        var indices = buckets.stream().map(com.titan.titancorebanking.model.AccountBucket::getBucketIndex).sorted().toList();
+        assertThat(indices).containsExactly(0, 1, 2, 3, 4, 5, 6, 7);
+    }
+
+    @Test
+    @DisplayName("audit_failedAuditSurvivesMoneyMovementRollback — failed transfer rolls back balance but persists FAILED audit record")
+    void audit_failedAuditSurvivesMoneyMovementRollback() {
+        setSecurityContext(alice);
+        BigDecimal aliceBefore = aliceAccount.getBalance();
+        BigDecimal bobBefore = bobAccount.getBalance();
+
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                new BigDecimal("250.00"), WRONG_PIN, "Failed transfer test", null, null, null);
+
+        assertThatThrownBy(() -> transactionService.transfer(req, alice.getUsername()))
+                .isInstanceOf(InvalidPinException.class);
+
+        Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        Account refreshedBob = accountRepository.findByAccountNumber(bobAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedAlice.getBalance()).isEqualByComparingTo(aliceBefore);
+        assertThat(refreshedBob.getBalance()).isEqualByComparingTo(bobBefore);
+
+        List<Transaction> failedTxs = transactionRepository.findByFromAccountIdAndStatus(
+                aliceAccount.getId(), TransactionStatus.FAILED);
+        assertThat(failedTxs).isNotEmpty();
+        Transaction failedTx = failedTxs.get(0);
+        assertThat(failedTx.getTransactionType()).isEqualTo(TransactionType.TRANSFER);
+        assertThat(failedTx.getNote()).contains("Invalid PIN");
+    }
+
+    @Test
+    @DisplayName("transfer_idempotency_differentPayload_throwsIllegalStateException — reusing same key with different amount or target is rejected")
+    void transfer_idempotency_differentPayload_throwsIllegalStateException() {
+        setSecurityContext(alice);
+        String sharedKey = "IDEMP-MISMATCH-KEY-001";
+        BigDecimal aliceInitial = aliceAccount.getBalance();
+
+        // 1. Initial valid transfer
+        TransactionRequest firstReq = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                new BigDecimal("100.00"), PLAINTEXT_PIN, "Original transfer", null, null, sharedKey);
+
+        TransactionResponse firstTx = transactionService.transfer(firstReq, alice.getUsername());
+        assertThat(firstTx).isNotNull();
+        assertThat(firstTx.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+
+        Account aliceAfterFirst = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        // Alice debited $100 + $1 fee (STANDARD tier) = $101
+        assertThat(aliceAfterFirst.getBalance()).isEqualByComparingTo(aliceInitial.subtract(new BigDecimal("101.0000")));
+
+        // 2. Replay with same key but DIFFERENT amount ($500 instead of $100)
+        TransactionRequest secondReq = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                new BigDecimal("500.00"), PLAINTEXT_PIN, "Tampered transfer", null, null, sharedKey);
+
+        assertThatThrownBy(() -> transactionService.transfer(secondReq, alice.getUsername()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Idempotency conflict");
+
+        // Alice balance must NOT be debited again
+        Account aliceAfterSecond = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        assertThat(aliceAfterSecond.getBalance()).isEqualByComparingTo(aliceAfterFirst.getBalance());
+    }
+
+    @Test
+    @DisplayName("withdraw_idempotency_differentPayload_throwsIllegalStateException — reusing same key with different amount is rejected")
+    void withdraw_idempotency_differentPayload_throwsIllegalStateException() {
+        setSecurityContext(alice);
+        String sharedKey = "WITHDRAW-IDEMP-MISMATCH-001";
+        BigDecimal aliceInitial = aliceAccount.getBalance();
+
+        TransactionRequest firstReq = new TransactionRequest(
+                aliceAccount.getAccountNumber(), null,
+                new BigDecimal("50.00"), PLAINTEXT_PIN, "Original withdraw", null, null, sharedKey);
+
+        TransactionResponse firstTx = transactionService.withdraw(firstReq, alice.getUsername());
+        assertThat(firstTx.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+
+        Account aliceAfterFirst = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        assertThat(aliceAfterFirst.getBalance()).isEqualByComparingTo(aliceInitial.subtract(new BigDecimal("50.0000")));
+
+        TransactionRequest secondReq = new TransactionRequest(
+                aliceAccount.getAccountNumber(), null,
+                new BigDecimal("200.00"), PLAINTEXT_PIN, "Tampered withdraw", null, null, sharedKey);
+
+        assertThatThrownBy(() -> transactionService.withdraw(secondReq, alice.getUsername()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Idempotency conflict");
+
+        Account aliceAfterSecond = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        assertThat(aliceAfterSecond.getBalance()).isEqualByComparingTo(aliceAfterFirst.getBalance());
+    }
+
+    @Test
+    @DisplayName("deposit_idempotency_unauthorizedReplay_throwsSecurityException — non-owner cannot replay another user's deposit")
+    void deposit_idempotency_unauthorizedReplay_throwsSecurityException() {
+        setSecurityContext(alice);
+        String sharedKey = "DEP-REPLAY-KEY-001";
+
+        TransactionRequest aliceDeposit = new TransactionRequest(
+                null, aliceAccount.getAccountNumber(),
+                new BigDecimal("300.00"), null, "Alice deposit", null, null, sharedKey);
+
+        TransactionResponse depositTx = transactionService.deposit(aliceDeposit, alice.getUsername());
+        assertThat(depositTx.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+
+        // Charlie tries to replay Alice's deposit
+        setSecurityContext(charlie);
+        assertThatThrownBy(() -> transactionService.deposit(aliceDeposit, charlie.getUsername()))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("You do not own this account");
+    }
+
+    @Test
+    @DisplayName("transfer_dailyLimit_failedAuditRecordPersisted — pre-flight daily limit rejection persists FAILED audit record")
+    void transfer_dailyLimit_failedAuditRecordPersisted() {
+        setSecurityContext(alice);
+        aliceAccount.setBalance(new BigDecimal("200000.0000"));
+        accountRepository.save(aliceAccount);
+
+        BigDecimal excessiveAmount = new BigDecimal("60000.00");
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                excessiveAmount, PLAINTEXT_PIN, "Excessive transfer", null, null, null);
+
+        assertThatThrownBy(() -> transactionService.transfer(req, alice.getUsername()))
+                .isInstanceOf(DailyLimitExceededException.class);
+
+        List<Transaction> failedTxs = transactionRepository.findByFromAccountIdAndStatus(
+                aliceAccount.getId(), TransactionStatus.FAILED);
+        assertThat(failedTxs).isNotEmpty();
+        Transaction failedTx = failedTxs.get(0);
+        assertThat(failedTx.getTransactionType()).isEqualTo(TransactionType.TRANSFER);
+        assertThat(failedTx.getNote()).contains("Daily transfer limit");
+    }
+
+    @Test
+    @DisplayName("transfer_crossCurrencyFx_doubleEntryBalanced — multi-currency transfer balances both currency legs in ledger")
+    void transfer_crossCurrencyFx_doubleEntryBalanced() {
+        Account bobEurAccount = accountRepository.save(Account.builder()
+                .accountNumber("ACC-BOB-EUR-001")
+                .accountType(AccountType.SAVINGS)
+                .currency(Currency.EUR)
+                .balance(BigDecimal.ZERO)
+                .overdraftLimit(BigDecimal.ZERO)
+                .status(AccountStatus.ACTIVE)
+                .user(bob)
+                .build());
+
+        setSecurityContext(alice);
+        BigDecimal transferUsd = new BigDecimal("100.00");
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobEurAccount.getAccountNumber(),
+                transferUsd, PLAINTEXT_PIN, "FX USD to EUR", null, null, null);
+
+        TransactionResponse tx = transactionService.transfer(req, alice.getUsername());
+        assertThat(tx.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+
+        Account refreshedBobEur = accountRepository.findByAccountNumber(bobEurAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedBobEur.getBalance()).isGreaterThan(BigDecimal.ZERO);
+    }
+
+    @Test
+    @DisplayName("transfer_concurrentIdempotency_sameKeyExtremeConcurrency_exactlyOneExecution — 10 simultaneous threads with identical idempotency key result in exactly 1 debit and matching response")
+    void transfer_concurrentIdempotency_sameKeyExtremeConcurrency_exactlyOneExecution() throws Exception {
+        final int THREAD_COUNT = 10;
+        final String sharedKey = "IDEMP-CONCUR-" + UUID.randomUUID();
+        final BigDecimal transferAmount = new BigDecimal("100.00");
+        final BigDecimal fee = feeStrategyFactory.getStrategy(alice.getTier()).calculateFee(transferAmount);
+        final BigDecimal totalDeduction = transferAmount.add(fee);
+
+        BigDecimal aliceInitial = aliceAccount.getBalance();
+        BigDecimal bobInitial = bobAccount.getBalance();
+
+        ExecutorService executor = Executors.newFixedThreadPool(THREAD_COUNT);
+        CountDownLatch readyLatch = new CountDownLatch(THREAD_COUNT);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        List<Future<TransactionResponse>> futures = new ArrayList<>();
+
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            futures.add(executor.submit(() -> {
+                setSecurityContext(alice);
+                readyLatch.countDown();
+                startLatch.await();
+                TransactionRequest req = new TransactionRequest(
+                        aliceAccount.getAccountNumber(),
+                        bobAccount.getAccountNumber(),
+                        transferAmount,
+                        PLAINTEXT_PIN,
+                        "Concurrent idempotency test",
+                        null, null, sharedKey);
+                return transactionService.transfer(req, alice.getUsername());
+            }));
+        }
+
+        readyLatch.await(10, TimeUnit.SECONDS);
+        startLatch.countDown(); // Release all threads at the exact same millisecond
+
+        List<TransactionResponse> results = new ArrayList<>();
+        for (Future<TransactionResponse> future : futures) {
+            results.add(future.get(10, TimeUnit.SECONDS));
+        }
+        executor.shutdown();
+
+        assertThat(results).hasSize(THREAD_COUNT);
+        Long expectedTxId = results.get(0).id();
+        for (TransactionResponse item : results) {
+            assertThat(item.id())
+                    .as("All concurrent calls must return the identical transaction ID")
+                    .isEqualTo(expectedTxId);
+            assertThat(item.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        }
+
+        // Database must have exactly ONE transaction record with this idempotency key
+        Long countInDb = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM transactions WHERE idempotency_key = ?",
+                Long.class, sharedKey);
+        assertThat(countInDb).isEqualTo(1L);
+
+        // Balances must reflect exactly ONE transfer
+        Account finalAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        Account finalBob = accountRepository.findByAccountNumber(bobAccount.getAccountNumber()).orElseThrow();
+
+        assertThat(finalAlice.getBalance()).isEqualByComparingTo(aliceInitial.subtract(totalDeduction));
+        assertThat(finalBob.getBalance()).isEqualByComparingTo(bobInitial.add(transferAmount));
+    }
+
+    @Test
+    @DisplayName("withdraw_concurrentIdempotency_sameKeyExtremeConcurrency_exactlyOneExecution — 10 simultaneous threads with identical idempotency key result in exactly 1 debit")
+    void withdraw_concurrentIdempotency_sameKeyExtremeConcurrency_exactlyOneExecution() throws Exception {
+        final int THREAD_COUNT = 10;
+        final String sharedKey = "WITHDRAW-CONCUR-" + UUID.randomUUID();
+        final BigDecimal withdrawAmount = new BigDecimal("50.00");
+
+        BigDecimal aliceInitial = aliceAccount.getBalance();
+
+        ExecutorService executor = Executors.newFixedThreadPool(THREAD_COUNT);
+        CountDownLatch readyLatch = new CountDownLatch(THREAD_COUNT);
+        CountDownLatch startLatch = new CountDownLatch(1);
+        List<Future<TransactionResponse>> futures = new ArrayList<>();
+
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            futures.add(executor.submit(() -> {
+                setSecurityContext(alice);
+                readyLatch.countDown();
+                startLatch.await();
+                TransactionRequest req = new TransactionRequest(
+                        aliceAccount.getAccountNumber(),
+                        null,
+                        withdrawAmount,
+                        PLAINTEXT_PIN,
+                        "Concurrent withdraw idempotency test",
+                        null, null, sharedKey);
+                return transactionService.withdraw(req, alice.getUsername());
+            }));
+        }
+
+        readyLatch.await(10, TimeUnit.SECONDS);
+        startLatch.countDown();
+
+        List<TransactionResponse> results = new ArrayList<>();
+        for (Future<TransactionResponse> future : futures) {
+            results.add(future.get(10, TimeUnit.SECONDS));
+        }
+        executor.shutdown();
+
+        assertThat(results).hasSize(THREAD_COUNT);
+        Long expectedTxId = results.get(0).id();
+        for (TransactionResponse item : results) {
+            assertThat(item.id())
+                    .as("All concurrent calls must return the identical transaction ID")
+                    .isEqualTo(expectedTxId);
+            assertThat(item.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+        }
+
+        Long countInDb = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM transactions WHERE idempotency_key = ?",
+                Long.class, sharedKey);
+        assertThat(countInDb).isEqualTo(1L);
+
+        Account finalAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        assertThat(finalAlice.getBalance()).isEqualByComparingTo(aliceInitial.subtract(withdrawAmount));
+    }
+
+    @Test
+    @DisplayName("getTransactionHistory_paginationAndDeterministicOrdering — verifies paginated history with stable tie-breaker")
+    void getTransactionHistory_paginationAndDeterministicOrdering() {
+        setSecurityContext(alice);
+
+        // Perform 3 sequential transfers
+        for (int i = 1; i <= 3; i++) {
+            TransactionRequest req = new TransactionRequest(
+                    aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                    new BigDecimal("10.00"), PLAINTEXT_PIN, "History #" + i,
+                    null, null, "PAG-TX-" + i);
+            transactionService.transfer(req, alice.getUsername());
+        }
+
+        // Fetch page 0 with size 2
+        Page<TransactionResponse> page0 = transactionService.getTransactionHistory(
+                alice.getUsername(), PageRequest.of(0, 2));
+
+        assertThat(page0.getContent()).hasSize(2);
+        assertThat(page0.getTotalElements()).isGreaterThanOrEqualTo(3L);
+
+        // Verify deterministic descending tie-breaker: first item has ID > second item if timestamps match
+        TransactionResponse first = page0.getContent().get(0);
+        TransactionResponse second = page0.getContent().get(1);
+        if (first.timestamp().isEqual(second.timestamp())) {
+            assertThat(first.id()).isGreaterThan(second.id());
+        } else {
+            assertThat(first.timestamp()).isAfterOrEqualTo(second.timestamp());
+        }
+    }
+
+    @Test
+    @DisplayName("getTransactionHistory_idorForbidden_throwsAccessDeniedException — non-owner cannot view another user's history")
+    void getTransactionHistory_idorForbidden_throwsAccessDeniedException() {
+        setSecurityContext(charlie);
+
+        assertThatThrownBy(() -> transactionService.getTransactionHistory(alice.getUsername()))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("You do not have permission to view transaction history");
+    }
+
+    @Test
+    @DisplayName("getLastTransaction_idorForbidden_throwsAccessDeniedException — non-owner cannot inspect another user's latest transaction")
+    void getLastTransaction_idorForbidden_throwsAccessDeniedException() {
+        setSecurityContext(charlie);
+
+        assertThatThrownBy(() -> transactionService.getLastTransaction(alice.getUsername()))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("You do not have permission to view transaction history");
+    }
+
+    @Test
+    @DisplayName("transfer_callerSuppliedIdentitySpoofing_throwsAccessDeniedException — authenticated user cannot supply another user's username")
+    void transfer_callerSuppliedIdentitySpoofing_throwsAccessDeniedException() {
+        setSecurityContext(charlie); // Authenticated as Charlie
+
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                new BigDecimal("50.00"), PLAINTEXT_PIN, "Spoofing attempt",
+                null, null, null);
+
+        // Charlie tries to supply alice's username as caller
+        assertThatThrownBy(() -> transactionService.transfer(req, alice.getUsername()))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("Authenticated identity does not match supplied username");
+    }
+
+    @Test
+    @DisplayName("withdraw_callerSuppliedIdentitySpoofing_throwsAccessDeniedException — authenticated user cannot supply another user's username")
+    void withdraw_callerSuppliedIdentitySpoofing_throwsAccessDeniedException() {
+        setSecurityContext(charlie); // Authenticated as Charlie
+
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), null,
+                new BigDecimal("50.00"), PLAINTEXT_PIN, "Spoofing attempt",
+                null, null, null);
+
+        // Charlie tries to supply alice's username as caller
+        assertThatThrownBy(() -> transactionService.withdraw(req, alice.getUsername()))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("Authenticated identity does not match supplied username");
+    }
+
+    @Test
+    @DisplayName("deposit_callerSuppliedIdentitySpoofing_throwsAccessDeniedException — authenticated non-staff user cannot supply another user's username")
+    void deposit_callerSuppliedIdentitySpoofing_throwsAccessDeniedException() {
+        setSecurityContext(charlie); // Standard customer Charlie
+
+        TransactionRequest req = new TransactionRequest(
+                null, aliceAccount.getAccountNumber(),
+                new BigDecimal("50.00"), null, "Spoofing attempt",
+                null, null, null);
+
+        // Charlie (standard customer) tries to supply alice's username as caller
+        assertThatThrownBy(() -> transactionService.deposit(req, alice.getUsername()))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("Authenticated identity does not match supplied username");
+    }
+
+    @Test
+    @DisplayName("depositInternal_unauthorizedCaller_throwsAccessDeniedException — non-system caller cannot invoke depositInternal")
+    void depositInternal_unauthorizedCaller_throwsAccessDeniedException() {
+        setSecurityContext(alice); // Standard user
+
+        TransactionRequest req = new TransactionRequest(
+                null, aliceAccount.getAccountNumber(),
+                new BigDecimal("500.00"), null, "Rogue internal deposit",
+                null, null, null);
+
+        assertThatThrownBy(() -> transactionService.depositInternal(req, "ROGUE_CALLER"))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("Caller is not authorized to invoke internal system deposits");
+    }
+
+    // ── 23. Fail-Closed Authentication & Access Policies (Recommended Steps 1, 3, 5) ──
+
+    @Test
+    @DisplayName("getTransactionHistory_unauthenticated_throwsAuthenticationCredentialsNotFoundException — unauthenticated history call fails closed")
+    void getTransactionHistory_unauthenticated_throwsAuthenticationCredentialsNotFoundException() {
+        SecurityContextHolder.clearContext();
+
+        assertThatThrownBy(() -> transactionService.getTransactionHistory(alice.getUsername()))
+                .isInstanceOf(AuthenticationCredentialsNotFoundException.class)
+                .hasMessageContaining("Full authentication is required");
+    }
+
+    @Test
+    @DisplayName("getTransactionHistory_anonymous_throwsAuthenticationCredentialsNotFoundException — anonymous history call fails closed")
+    void getTransactionHistory_anonymous_throwsAuthenticationCredentialsNotFoundException() {
+        SecurityContextHolder.getContext().setAuthentication(
+                new AnonymousAuthenticationToken("key", "anonymousUser", AuthorityUtils.createAuthorityList("ROLE_ANONYMOUS")));
+
+        assertThatThrownBy(() -> transactionService.getTransactionHistory(alice.getUsername()))
+                .isInstanceOf(AuthenticationCredentialsNotFoundException.class)
+                .hasMessageContaining("Full authentication is required");
+    }
+
+    @Test
+    @DisplayName("getTransactionHistory_adminPrivilegedAccess_allowed — platform admin can inspect any user's history")
+    void getTransactionHistory_adminPrivilegedAccess_allowed() {
+        // Perform a transaction for Alice
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                new BigDecimal("100.00"), PLAINTEXT_PIN, "Admin history test",
+                null, null, null);
+        setSecurityContext(alice);
+        transactionService.transfer(req, alice.getUsername());
+
+        // Authenticate as ADMIN
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken("SYSTEM_BANK", null,
+                        List.of(new SimpleGrantedAuthority("ROLE_ADMIN"))));
+
+        List<TransactionResponse> history = transactionService.getTransactionHistory(alice.getUsername());
+        assertThat(history).isNotEmpty();
+        assertThat(history.get(0).fromAccount()).isEqualTo(aliceAccount.getAccountNumber());
+    }
+
+    @Test
+    @DisplayName("getTransactionHistory_operatorPrivilegedAccess_allowed — branch operator can inspect any customer's history")
+    void getTransactionHistory_operatorPrivilegedAccess_allowed() {
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                new BigDecimal("150.00"), PLAINTEXT_PIN, "Operator history test",
+                null, null, null);
+        setSecurityContext(alice);
+        transactionService.transfer(req, alice.getUsername());
+
+        // Authenticate as OPERATOR
+        setSecurityContext(operator);
+
+        List<TransactionResponse> history = transactionService.getTransactionHistory(alice.getUsername());
+        assertThat(history).isNotEmpty();
+        assertThat(history.get(0).fromAccount()).isEqualTo(aliceAccount.getAccountNumber());
+    }
+
+    @Test
+    @DisplayName("transfer_unauthenticatedDirectInvocation_throwsAuthenticationCredentialsNotFoundException — direct service transfer fails closed")
+    void transfer_unauthenticatedDirectInvocation_throwsAuthenticationCredentialsNotFoundException() {
+        SecurityContextHolder.clearContext();
+
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                new BigDecimal("50.00"), PLAINTEXT_PIN, "Unauth direct transfer",
+                null, null, null);
+
+        assertThatThrownBy(() -> transactionService.transfer(req, alice.getUsername()))
+                .isInstanceOf(AuthenticationCredentialsNotFoundException.class)
+                .hasMessageContaining("Full authentication is required");
+    }
+
+    @Test
+    @DisplayName("withdraw_unauthenticatedDirectInvocation_throwsAuthenticationCredentialsNotFoundException — direct service withdraw fails closed")
+    void withdraw_unauthenticatedDirectInvocation_throwsAuthenticationCredentialsNotFoundException() {
+        SecurityContextHolder.clearContext();
+
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), null,
+                new BigDecimal("50.00"), PLAINTEXT_PIN, "Unauth direct withdraw",
+                null, null, null);
+
+        assertThatThrownBy(() -> transactionService.withdraw(req, alice.getUsername()))
+                .isInstanceOf(AuthenticationCredentialsNotFoundException.class)
+                .hasMessageContaining("Full authentication is required");
+    }
+
+    @Test
+    @DisplayName("deposit_operatorCanDepositToCustomerAccount_success — branch teller can deposit into third-party customer accounts")
+    void deposit_operatorCanDepositToCustomerAccount_success() {
+        BigDecimal balanceBefore = aliceAccount.getBalance();
+        BigDecimal depositAmount = new BigDecimal("800.00");
+
+        setSecurityContext(operator); // Branch operator
+        TransactionRequest req = new TransactionRequest(
+                null, aliceAccount.getAccountNumber(),
+                depositAmount, null, "Teller branch deposit",
+                null, null, null);
+
+        TransactionResponse tx = transactionService.deposit(req, operator.getUsername());
+        assertThat(tx.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+
+        Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        assertThat(refreshedAlice.getBalance()).isEqualByComparingTo(balanceBefore.add(depositAmount));
+    }
+
+    @Test
+    @DisplayName("pagination_clampedToMaxSize — page requests exceeding MAX_PAGE_SIZE are clamped to 100")
+    void pagination_clampedToMaxSize() {
+        setSecurityContext(alice);
+        org.springframework.data.domain.Pageable excessivePageable = PageRequest.of(0, 500);
+
+        Page<TransactionResponse> page = transactionService.getTransactionHistory(alice.getUsername(), excessivePageable);
+        assertThat(page.getPageable().getPageSize()).isEqualTo(100);
+    }
+
+    @Test
+    @DisplayName("pagination_safeNormalization — unpaged or null normalized to safe bounded defaults")
+    void pagination_safeNormalization() {
+        org.springframework.data.domain.Pageable unpagedNormalized =
+                com.titan.titancorebanking.utils.PaginationUtils.clampPageable(org.springframework.data.domain.Pageable.unpaged());
+        assertThat(unpagedNormalized.getPageSize()).isEqualTo(20);
+        assertThat(unpagedNormalized.getPageNumber()).isEqualTo(0);
+
+        org.springframework.data.domain.Pageable nullNormalized =
+                com.titan.titancorebanking.utils.PaginationUtils.clampPageable(null);
+        assertThat(nullNormalized.getPageSize()).isEqualTo(20);
+        assertThat(nullNormalized.getPageNumber()).isEqualTo(0);
+
+        // Verify backward compatibility of delegate on TransactionService
+        org.springframework.data.domain.Pageable legacyDelegate =
+                com.titan.titancorebanking.service.TransactionService.clampPageable(null);
+        assertThat(legacyDelegate.getPageSize()).isEqualTo(20);
+        assertThat(legacyDelegate.getPageNumber()).isEqualTo(0);
+    }
+
+    @Test
+    @DisplayName("executeScheduledTransfer_unauthorizedUser_throwsAccessDeniedException — customer cannot invoke executeScheduledTransfer")
+    void executeScheduledTransfer_unauthorizedUser_throwsAccessDeniedException() {
+        setSecurityContext(charlie); // Customer without ROLE_SYSTEM
+
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                new BigDecimal("50.00"), null, "Scheduled transfer probe",
+                null, null, null);
+
+        assertThatThrownBy(() -> transactionService.executeScheduledTransfer(req, alice.getUsername()))
+                .isInstanceOf(AccessDeniedException.class)
+                .hasMessageContaining("Caller is not authorized to execute scheduled transfers");
+    }
+
+    @Test
+    @DisplayName("executeScheduledTransfer_systemRole_success — SYSTEM caller executes scheduled transfer without PIN")
+    void executeScheduledTransfer_systemRole_success() {
+        BigDecimal aliceBefore = aliceAccount.getBalance();
+        BigDecimal bobBefore = bobAccount.getBalance();
+        BigDecimal amount = new BigDecimal("250.00");
+
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken("SYSTEM_SCHEDULER", null,
+                        List.of(new SimpleGrantedAuthority("ROLE_SYSTEM"))));
+
+        TransactionRequest req = new TransactionRequest(
+                aliceAccount.getAccountNumber(), bobAccount.getAccountNumber(),
+                amount, null, "Scheduled batch rent",
+                null, null, "SCHED-RENT-001");
+
+        TransactionResponse tx = transactionService.executeScheduledTransfer(req, alice.getUsername());
+        assertThat(tx.status()).isEqualTo(TransactionStatus.SUCCESS.name());
+
+        Account refreshedAlice = accountRepository.findByAccountNumber(aliceAccount.getAccountNumber()).orElseThrow();
+        BigDecimal fee = feeStrategyFactory.getStrategy(alice.getTier()).calculateFee(amount);
+        BigDecimal totalDeduction = amount.add(fee);
+        assertThat(refreshedAlice.getBalance()).isEqualByComparingTo(aliceBefore.subtract(totalDeduction));
     }
 }
