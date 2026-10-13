@@ -92,6 +92,87 @@ public class IdempotencyService {
     }
     
     /**
+     * Atomically acquires an in-progress idempotency reservation lock via Redis SETNX.
+     * Prevents TOCTOU race conditions where two identical requests arrive simultaneously.
+     * Returns true if lock was acquired or Redis is unavailable (falling back to DB unique constraint).
+     * Returns false if another request is currently processing this key.
+     */
+    /**
+     * Atomically acquires an in-progress idempotency reservation lock via Redis SETNX.
+     * Prevents TOCTOU race conditions where two identical requests arrive simultaneously.
+     * Returns true if lock was acquired or Redis is unavailable (falling back to DB unique constraint).
+     * Returns false if another request is currently processing this key.
+     */
+    public boolean acquireLock(String idempotencyKey, String uri) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return true;
+        }
+        try {
+            String lockKey = buildLockKey(uri, idempotencyKey);
+            Boolean acquired = redisTemplate.opsForValue().setIfAbsent(lockKey, "IN_PROGRESS", Duration.ofMinutes(2));
+            return Boolean.TRUE.equals(acquired);
+        } catch (Exception e) {
+            log.warn("⚠️ Redis unavailable for idempotency lock, relying on DB unique constraint: {}", e.getMessage());
+            return true;
+        }
+    }
+
+    /**
+     * Releases the in-progress idempotency reservation lock in Redis.
+     */
+    public void releaseLock(String idempotencyKey, String uri) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return;
+        }
+        try {
+            String lockKey = buildLockKey(uri, idempotencyKey);
+            redisTemplate.delete(lockKey);
+        } catch (Exception e) {
+            log.warn("⚠️ Failed to release idempotency lock: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Awaits completion of a concurrent transaction already holding the idempotency lock,
+     * or acquires leadership if the peer aborted/failed and released it.
+     *
+     * @param idempotencyKey the client idempotency key
+     * @param uri the endpoint URI
+     * @return Optional containing the completed transaction if peer succeeded,
+     *         or Optional.empty() if this thread successfully acquired the lock and should proceed as leader.
+     * @throws IllegalStateException if peer is still in-progress after timeout
+     */
+    public Optional<Transaction> awaitResolutionOrAcquire(String idempotencyKey, String uri) {
+        final int maxAttempts = 15; // 15 * 200ms = 3.0 seconds total wait
+        final long waitIntervalMs = 200;
+
+        for (int i = 0; i < maxAttempts; i++) {
+            try {
+                Thread.sleep(waitIntervalMs);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while awaiting concurrent idempotency resolution.", ie);
+            }
+
+            Optional<Transaction> existing = getTransaction(idempotencyKey, uri);
+            if (existing.isPresent()) {
+                return existing;
+            }
+
+            // If peer released lock (e.g. failed/rolled back), attempt to claim leadership
+            if (acquireLock(idempotencyKey, uri)) {
+                log.info("Acquired idempotency lock after peer release. key={}", idempotencyKey);
+                return Optional.empty();
+            }
+        }
+
+        log.warn("Concurrent transaction with idempotency key {} is still in-progress after timeout.", idempotencyKey);
+        throw new IllegalStateException(String.format(
+                "A transaction with idempotency key '%s' is currently being processed. Please retry shortly.",
+                idempotencyKey));
+    }
+
+    /**
      * Build cache key matching IdempotencyInterceptor format.
      * Format: idempotency:{principal}:{uri}:{key}
      */
@@ -101,5 +182,9 @@ public class IdempotencyService {
                 ? authentication.getName()
                 : "anonymous";
         return String.format("idempotency:%s:%s:%s", principal, uri, idempotencyKey);
+    }
+
+    private String buildLockKey(String uri, String idempotencyKey) {
+        return String.format("idempotency_lock:%s:%s", uri, idempotencyKey);
     }
 }
