@@ -1,7 +1,8 @@
 package com.titan.titancorebanking.exception;
 
 import com.titan.titancorebanking.dto.response.ErrorResponse;
-import com.titan.titancorebanking.exception.DailyLimitExceededException;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -9,18 +10,14 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.client.RestClientException;
 import org.springframework.web.context.request.WebRequest;
 
 import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
-/**
- * Enhanced Global Exception Handler.
- * Now intercepts RestClientExceptions to prevent internal downstream failures
- * from surfacing raw stack traces to the public API.
- */
+@Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
@@ -42,40 +39,16 @@ public class GlobalExceptionHandler {
         return new ResponseEntity<>(response, HttpStatus.BAD_REQUEST);
     }
 
-    @ExceptionHandler(DailyLimitExceededException.class)
-    public ResponseEntity<ErrorResponse> handleDailyLimitExceeded(DailyLimitExceededException ex, WebRequest request) {
-        ErrorResponse errorResponse = ErrorResponse.builder()
-                .timestamp(LocalDateTime.now())
-                .status(HttpStatus.UNPROCESSABLE_ENTITY.value())
-                .error("Daily Transfer Limit Exceeded")
-                .message(ex.getMessage())
-                .path(request.getDescription(false).replace("uri=", ""))
-                .build();
-        return new ResponseEntity<>(errorResponse, HttpStatus.UNPROCESSABLE_ENTITY);
-    }
-
     @ExceptionHandler(InsufficientBalanceException.class)
     public ResponseEntity<ErrorResponse> handleInsufficientBalance(InsufficientBalanceException ex, WebRequest request) {
-        ErrorResponse errorResponse = ErrorResponse.builder()
-                .timestamp(LocalDateTime.now())
-                .status(HttpStatus.BAD_REQUEST.value())
-                .error("Business Rule Violation")
-                .message(ex.getMessage())
-                .path(request.getDescription(false).replace("uri=", ""))
-                .build();
-        return new ResponseEntity<>(errorResponse, HttpStatus.BAD_REQUEST);
+        return buildErrorResponse(HttpStatus.BAD_REQUEST, "Business Rule Violation", ex.getMessage(), request);
     }
 
     @ExceptionHandler(RedisConnectionFailureException.class)
     public ResponseEntity<ErrorResponse> handleRedisDown(RedisConnectionFailureException ex, WebRequest request) {
-        ErrorResponse errorResponse = ErrorResponse.builder()
-                .timestamp(LocalDateTime.now())
-                .status(HttpStatus.SERVICE_UNAVAILABLE.value())
-                .error("Cache Unavailable")
-                .message("Cache service is temporarily unavailable. Please retry.")
-                .path(request.getDescription(false).replace("uri=", ""))
-                .build();
-        return new ResponseEntity<>(errorResponse, HttpStatus.SERVICE_UNAVAILABLE);
+        log.error("Redis Connection Failure: {}", ex.getMessage());
+        return buildErrorResponse(HttpStatus.SERVICE_UNAVAILABLE, "Cache Unavailable",
+                "System is experiencing temporary delays. Please try again.", request);
     }
 
     @ExceptionHandler({
@@ -83,14 +56,10 @@ public class GlobalExceptionHandler {
             SecurityException.class
     })
     public ResponseEntity<ErrorResponse> handleAccessDenied(Exception ex, WebRequest request) {
-        ErrorResponse errorResponse = ErrorResponse.builder()
-                .timestamp(LocalDateTime.now())
-                .status(HttpStatus.FORBIDDEN.value())
-                .error("Access Denied")
-                .message("You do not have permission to access this resource.")
-                .path(request.getDescription(false).replace("uri=", ""))
-                .build();
-        return new ResponseEntity<>(errorResponse, HttpStatus.FORBIDDEN);
+        // Log the actual security exception internally, but return a generic 403 to the client
+        log.warn("Access Denied for request {}: {}", request.getDescription(false), ex.getMessage());
+        return buildErrorResponse(HttpStatus.FORBIDDEN, "Access Denied",
+                "You do not have permission to access this resource.", request);
     }
 
     @ExceptionHandler({
@@ -98,49 +67,48 @@ public class GlobalExceptionHandler {
             org.springframework.dao.DataAccessResourceFailureException.class
     })
     public ResponseEntity<ErrorResponse> handleDatabasePoolExhaustion(Exception ex, WebRequest request) {
-        ErrorResponse errorResponse = ErrorResponse.builder()
-                .timestamp(LocalDateTime.now())
-                .status(HttpStatus.SERVICE_UNAVAILABLE.value())
-                .error("Service Temporarily Busy")
-                .message("Database connection pool is temporarily saturated under high load. Please retry.")
-                .path(request.getDescription(false).replace("uri=", ""))
-                .build();
-        return new ResponseEntity<>(errorResponse, HttpStatus.SERVICE_UNAVAILABLE);
+        log.error("Database connection failure: {}", ex.getMessage());
+        return buildErrorResponse(HttpStatus.SERVICE_UNAVAILABLE, "Service Temporarily Busy",
+                "High network traffic. Please retry in a few moments.", request);
     }
 
-    @ExceptionHandler(RestClientException.class)
-    public ResponseEntity<ErrorResponse> handleRestClientException(RestClientException ex, WebRequest request) {
-        ErrorResponse errorResponse = ErrorResponse.builder()
-                .timestamp(LocalDateTime.now())
-                .status(HttpStatus.SERVICE_UNAVAILABLE.value())
-                .error("Downstream Service Unavailable")
-                .message("A required internal service is currently unreachable.")
-                .path(request.getDescription(false).replace("uri=", ""))
-                .build();
-        return new ResponseEntity<>(errorResponse, HttpStatus.SERVICE_UNAVAILABLE);
+    @ExceptionHandler(RuntimeException.class)
+    public ResponseEntity<ErrorResponse> handleRuntimeException(RuntimeException ex, WebRequest request) {
+        return buildErrorResponse(HttpStatus.BAD_REQUEST, "Business Logic Error", ex.getMessage(), request);
     }
 
-    @ExceptionHandler({IllegalArgumentException.class, IllegalStateException.class})
-    public ResponseEntity<ErrorResponse> handleBadRequestExceptions(RuntimeException ex, WebRequest request) {
-        ErrorResponse errorResponse = ErrorResponse.builder()
-                .timestamp(LocalDateTime.now())
-                .status(HttpStatus.BAD_REQUEST.value())
-                .error("Bad Request")
-                .message(ex.getMessage())
-                .path(request.getDescription(false).replace("uri=", ""))
-                .build();
-        return new ResponseEntity<>(errorResponse, HttpStatus.BAD_REQUEST);
-    }
-
+    // STAFF ENGINEER FIX: Prevent Information Exposure (CWE-209)
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleGlobalException(Exception ex, WebRequest request) {
+        String traceId = MDC.get("traceId");
+        if (traceId == null) {
+            traceId = UUID.randomUUID().toString();
+            MDC.put("traceId", traceId);
+        }
+
+        // Log the full stack trace internally with the traceId
+        log.error("[Trace-ID: {}] Unhandled System Exception: ", traceId, ex);
+
+        // Never return ex.getMessage() to the client for unhandled 500 errors
         ErrorResponse errorResponse = ErrorResponse.builder()
                 .timestamp(LocalDateTime.now())
                 .status(HttpStatus.INTERNAL_SERVER_ERROR.value())
                 .error("Internal Server Error")
-                .message("An unexpected error occurred. Please contact support.")
+                .message("An unexpected system error occurred. Reference Trace ID: " + traceId)
                 .path(request.getDescription(false).replace("uri=", ""))
                 .build();
+
         return new ResponseEntity<>(errorResponse, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+    private ResponseEntity<ErrorResponse> buildErrorResponse(HttpStatus status, String error, String message, WebRequest request) {
+        ErrorResponse errorResponse = ErrorResponse.builder()
+                .timestamp(LocalDateTime.now())
+                .status(status.value())
+                .error(error)
+                .message(message)
+                .path(request.getDescription(false).replace("uri=", ""))
+                .build();
+        return new ResponseEntity<>(errorResponse, status);
     }
 }
