@@ -10,12 +10,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.spec.X509EncodedKeySpec;
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.Base64;
 import java.util.List;
 
-/**
- * Task 6: Self-Sovereign Identity (SSI) & W3C Verifiable Credentials
- */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -30,8 +28,14 @@ public class VerifiableCredentialService {
         validateVcStructure(vc);
 
         String expirationDate = vc.path("expirationDate").asText(null);
-        if (expirationDate != null && Instant.parse(expirationDate).isBefore(Instant.now())) {
-            throw new SecurityException("Verifiable Credential has expired");
+        if (expirationDate != null) {
+            try {
+                if (Instant.parse(expirationDate).isBefore(Instant.now())) {
+                    throw new SecurityException("Verifiable Credential has expired");
+                }
+            } catch (DateTimeParseException e) {
+                throw new SecurityException("Invalid expiration date format");
+            }
         }
 
         String issuerDid = vc.path("issuer").asText();
@@ -67,7 +71,7 @@ public class VerifiableCredentialService {
                 true
         );
 
-        log.info("  VC verified for subject={} issued by={}", identity.subjectDid(), issuerDid);
+        log.info("VC verified securely for subject={} issued by={}", identity.subjectDid(), issuerDid);
         return identity;
     }
 
@@ -81,7 +85,10 @@ public class VerifiableCredentialService {
 
         boolean hasVcType = false;
         for (JsonNode t : vc.path("type")) {
-            if ("VerifiableCredential".equals(t.asText())) { hasVcType = true; break; }
+            if ("VerifiableCredential".equals(t.asText())) {
+                hasVcType = true;
+                break;
+            }
         }
         if (!hasVcType) throw new IllegalArgumentException("Not a VerifiableCredential");
     }
@@ -93,7 +100,6 @@ public class VerifiableCredentialService {
 
         KeyFactory kf = KeyFactory.getInstance("Ed25519");
         PublicKey pubKey = kf.generatePublic(new X509EncodedKeySpec(pubKeyBytes));
-
         Signature sig = Signature.getInstance("Ed25519");
         sig.initVerify(pubKey);
         sig.update(docBytes);
@@ -107,7 +113,6 @@ public class VerifiableCredentialService {
 
         KeyFactory kf = KeyFactory.getInstance("RSA");
         PublicKey pubKey = kf.generatePublic(new X509EncodedKeySpec(pubKeyBytes));
-
         Signature sig = Signature.getInstance("SHA256withRSA");
         sig.initVerify(pubKey);
         sig.update(docBytes);
