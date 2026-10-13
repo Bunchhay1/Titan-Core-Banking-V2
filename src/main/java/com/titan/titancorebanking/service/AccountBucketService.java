@@ -6,9 +6,10 @@ import com.titan.titancorebanking.repository.AccountBucketRepository;
 import com.titan.titancorebanking.repository.AccountRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Slice;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -23,10 +24,12 @@ import java.util.concurrent.ThreadLocalRandom;
 public class AccountBucketService {
 
     public static final int NUM_BUCKETS = 8;
+    private static final int CHUNK_SIZE = 500;
+
     private final AccountBucketRepository accountBucketRepository;
     private final AccountRepository accountRepository;
 
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional
     public List<AccountBucket> getOrInitializeBuckets(Account parentAccount) {
         List<AccountBucket> existing = accountBucketRepository.findByParentAccountId(parentAccount.getId());
         if (existing.size() >= NUM_BUCKETS) {
@@ -45,8 +48,7 @@ public class AccountBucketService {
                         .build();
                 buckets.add(accountBucketRepository.save(bucket));
             } catch (Exception e) {
-                // Ignore unique constraint violations if created concurrently by another thread
-                log.trace("Bucket {} already initialized for account {}", i, parentAccount.getId());
+                // Ignore concurrent initialization duplicates
             }
         }
         return accountBucketRepository.findByParentAccountId(parentAccount.getId());
@@ -80,20 +82,29 @@ public class AccountBucketService {
                 .add(bucketSum != null ? bucketSum : BigDecimal.ZERO);
     }
 
+    /**
+     * Memory-safe background sweeper routine using chunked slices.
+     */
     @Scheduled(fixedDelay = 60000)
     public void sweepAllBucketBalances() {
-        // Optimization: Only fetch parent accounts that actively have rows in account_buckets
-        List<Long> activeParentIds = accountBucketRepository.findDistinctParentAccountIds();
-        for (Long accountId : activeParentIds) {
-            try {
-                sweepAccountBuckets(accountId);
-            } catch (Exception e) {
-                log.error("Sweep failed for account ID {}: {}", accountId, e.getMessage());
+        int page = 0;
+        Slice<Account> accountSlice;
+
+        do {
+            accountSlice = accountRepository.findAllAccountsForReconciliation(PageRequest.of(page, CHUNK_SIZE));
+
+            for (Account account : accountSlice.getContent()) {
+                try {
+                    sweepAccountBuckets(account.getId());
+                } catch (Exception e) {
+                    log.debug("No bucket sweep needed for account ID {}: {}", account.getId(), e.getMessage());
+                }
             }
-        }
+            page++;
+        } while (accountSlice.hasNext());
     }
 
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional
     public void sweepAccountBuckets(Long parentAccountId) {
         List<AccountBucket> buckets = accountBucketRepository.findByParentAccountId(parentAccountId);
         if (buckets == null || buckets.isEmpty()) {
@@ -111,7 +122,6 @@ public class AccountBucketService {
             return;
         }
 
-        // Deterministic locking: Lock parent first, then buckets in order
         Account parent = accountRepository.findByIdWithLock(parentAccountId)
                 .orElseThrow(() -> new IllegalArgumentException("Parent account not found: " + parentAccountId));
 
@@ -126,5 +136,8 @@ public class AccountBucketService {
 
         parent.setBalance(parent.getBalance().add(totalToSweep));
         accountRepository.save(parent);
+
+        log.debug("Swept {} from {} buckets into parent account {}",
+                totalToSweep, buckets.size(), parent.getAccountNumber());
     }
 }
