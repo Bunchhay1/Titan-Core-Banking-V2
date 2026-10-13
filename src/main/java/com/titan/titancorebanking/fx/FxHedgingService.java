@@ -1,46 +1,44 @@
 package com.titan.titancorebanking.fx;
 
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestClient;
+import org.springframework.web.reactive.function.client.WebClient;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
-/**
- * Refactored Q-Learning Hedging Service.
- * Replaced blocking WebClient with RestClient to ensure Virtual Thread compliance.
- */
 @Service
+@RequiredArgsConstructor
 @Slf4j
 public class FxHedgingService {
 
-    private final RestClient restClient;
+    private final WebClient.Builder webClientBuilder;
     private final FxPositionRepository fxPositionRepository;
 
     @Value("${fx.data.url:https://api.frankfurter.app}")
     private String fxDataUrl;
 
+    // STAFF ENGINEER FIX: Fully concurrent 2D map to prevent state corruption across threads
     private final Map<String, Map<String, Double>> qTable = new ConcurrentHashMap<>();
+
+    // STAFF ENGINEER FIX: Thread-safe deque for sliding window
+    private final Deque<BigDecimal> rateHistory = new ConcurrentLinkedDeque<>();
 
     private static final double LEARNING_RATE = 0.1;
     private static final double DISCOUNT_FACTOR = 0.95;
     private static final double EPSILON = 0.1;
 
-    private final Deque<BigDecimal> rateHistory = new ArrayDeque<>(10);
     private BigDecimal lastRate = null;
     private String lastAction = null;
     private String lastStateKey = null;
-
-    public FxHedgingService(RestClient.Builder restClientBuilder, FxPositionRepository fxPositionRepository) {
-        this.restClient = restClientBuilder.build();
-        this.fxPositionRepository = fxPositionRepository;
-    }
 
     @Scheduled(fixedDelay = 30_000)
     public void evaluateAndHedge() {
@@ -48,7 +46,9 @@ public class FxHedgingService {
         if (currentRate == null) return;
 
         rateHistory.addLast(currentRate);
-        if (rateHistory.size() > 10) rateHistory.pollFirst();
+        while (rateHistory.size() > 10) {
+            rateHistory.pollFirst();
+        }
 
         String stateKey = computeStateKey(currentRate);
         String action = selectAction(stateKey);
@@ -64,11 +64,12 @@ public class FxHedgingService {
         lastAction = action;
         lastStateKey = stateKey;
 
-        log.info("FX Hedge: rate={} USD/KHR, state={}, action={}", currentRate, stateKey, action);
+        log.debug("FX Hedge Cycle: rate={} USD/KHR, state={}, action={}", currentRate, stateKey, action);
     }
 
     private String computeStateKey(BigDecimal currentRate) {
         if (rateHistory.size() < 2) return "STABLE_LOW";
+
         List<BigDecimal> rates = new ArrayList<>(rateHistory);
         BigDecimal prev = rates.get(rates.size() - 2);
 
@@ -92,15 +93,16 @@ public class FxHedgingService {
             return actions.get((int) (Math.random() * actions.size()));
         }
 
-        Map<String, Double> qValues = qTable.getOrDefault(stateKey, new HashMap<>());
+        Map<String, Double> qValues = qTable.getOrDefault(stateKey, new ConcurrentHashMap<>());
         return actions.stream()
                 .max(Comparator.comparingDouble(a -> qValues.getOrDefault(a, 0.0)))
                 .orElse("HOLD");
     }
 
     private void updateQTable(String state, String action, String nextState, double reward) {
-        qTable.computeIfAbsent(state, k -> new HashMap<>());
-        qTable.computeIfAbsent(nextState, k -> new HashMap<>());
+        // STAFF ENGINEER FIX: Ensure inner maps are also ConcurrentHashMap
+        qTable.computeIfAbsent(state, k -> new ConcurrentHashMap<>());
+        qTable.computeIfAbsent(nextState, k -> new ConcurrentHashMap<>());
 
         double currentQ = qTable.get(state).getOrDefault(action, 0.0);
         double maxNextQ = qTable.get(nextState).values().stream()
@@ -123,6 +125,8 @@ public class FxHedgingService {
 
     private void executeHedge(String action, BigDecimal rate) {
         BigDecimal exposure = getTotalPendingExposure();
+        if (exposure.compareTo(BigDecimal.ZERO) <= 0) return;
+
         BigDecimal hedgeAmount = switch (action) {
             case "HEDGE_FULL"  -> exposure;
             case "HEDGE_HALF"  -> exposure.divide(BigDecimal.TWO, 2, RoundingMode.HALF_UP);
@@ -138,17 +142,21 @@ public class FxHedgingService {
 
     private BigDecimal fetchRate(String from, String to) {
         try {
-            Map response = restClient.get()
-                    .uri(fxDataUrl + "/latest?from={from}&to={to}", from, to)
+            // STAFF ENGINEER FIX: Added 3-second hard timeout for external API calls
+            Map<?, ?> response = webClientBuilder.baseUrl(fxDataUrl).build()
+                    .get()
+                    .uri("/latest?from={from}&to={to}", from, to)
                     .retrieve()
-                    .body(Map.class);
+                    .bodyToMono(Map.class)
+                    .timeout(Duration.ofSeconds(3))
+                    .block();
 
             if (response != null) {
                 var rates = (Map<?, ?>) response.get("rates");
                 return new BigDecimal(rates.get(to).toString());
             }
         } catch (Exception e) {
-            log.debug("FX rate fetch failed", e);
+            log.warn("FX rate fetch failed due to timeout or network error: {}", e.getMessage());
         }
         return null;
     }
