@@ -3,9 +3,12 @@ package com.titan.titancorebanking.service.imple;
 import com.titan.titancorebanking.dto.request.LoginRequest;
 import com.titan.titancorebanking.dto.request.RegisterRequest;
 import com.titan.titancorebanking.dto.response.AuthResponse;
+import com.titan.titancorebanking.enums.UserTier;
 import com.titan.titancorebanking.model.User;
 import com.titan.titancorebanking.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -14,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class AuthenticationService {
 
     private final UserRepository userRepository;
@@ -23,40 +27,60 @@ public class AuthenticationService {
 
     @Transactional
     public AuthResponse register(RegisterRequest request) {
-        if (userRepository.existsByUsername(request.username())) {
-            throw new IllegalArgumentException("Username already exists");
-        }
-
-        var user = User.builder()
-                .firstName(request.firstName())
-                .lastName(request.lastName())
-                .email(request.email())
-                .username(request.username())
-                .password(passwordEncoder.encode(request.password()))
-                .pin(passwordEncoder.encode(request.pin()))
+        // Prepare user entity
+        User user = User.builder()
+                .firstName(request.getFirstName())
+                .lastName(request.getLastName())
+                .email(request.getEmail())
+                .username(request.getUsername())
+                .password(passwordEncoder.encode(request.getPassword()))
+                .pin(passwordEncoder.encode(request.getPin()))
                 .role("ROLE_USER")
+                .tier(UserTier.STANDARD)
+                .accountNonLocked(true)
                 .build();
 
-        userRepository.save(user);
-        var jwtToken = jwtService.generateToken(user);
+        try {
+            // Rely on the database unique constraint to prevent TOCTOU race conditions
+            userRepository.saveAndFlush(user);
+            log.info("New user registered successfully: {}", user.getUsername());
+        } catch (DataIntegrityViolationException e) {
+            log.warn("Registration failed - Unique constraint violation for username/email: {}", request.getUsername());
+            throw new IllegalArgumentException("Username or Email already exists in the system.");
+        }
 
-        return new AuthResponse(jwtToken, user.getId());
+        String jwtToken = jwtService.generateToken(user);
+
+        return AuthResponse.builder()
+                .token(jwtToken)
+                .id(user.getId())
+                .build();
     }
 
     @Transactional(readOnly = true)
     public AuthResponse login(LoginRequest request) {
+        // Authenticate credentials against SecurityContext
         authenticationManager.authenticate(
                 new UsernamePasswordAuthenticationToken(
-                        request.username(),
-                        request.password()
+                        request.getUsername(),
+                        request.getPassword()
                 )
         );
 
-        var user = userRepository.findByUsername(request.username())
-                .orElseThrow(() -> new IllegalArgumentException("Invalid credentials"));
+        User user = userRepository.findByUsername(request.getUsername())
+                .orElseThrow(() -> new IllegalArgumentException("User not found after authentication"));
 
-        var jwtToken = jwtService.generateToken(user);
+        if (!user.isAccountNonLocked()) {
+            throw new SecurityException("Your account has been temporarily locked due to suspicious activity.");
+        }
 
-        return new AuthResponse(jwtToken, user.getId());
+        String jwtToken = jwtService.generateToken(user);
+
+        log.debug("User logged in successfully: {}", user.getUsername());
+
+        return AuthResponse.builder()
+                .token(jwtToken)
+                .id(user.getId())
+                .build();
     }
 }
