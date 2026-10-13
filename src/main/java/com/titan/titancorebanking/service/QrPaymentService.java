@@ -6,9 +6,9 @@ import com.google.zxing.client.j2se.MatrixToImageWriter;
 import com.google.zxing.common.BitMatrix;
 import com.google.zxing.qrcode.QRCodeWriter;
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel;
-import com.titan.titancorebanking.dto.request.GenerateQrRequest;
-import com.titan.titancorebanking.dto.request.GeneratePayerQrRequest;
 import com.titan.titancorebanking.dto.request.CollectByQrRequest;
+import com.titan.titancorebanking.dto.request.GeneratePayerQrRequest;
+import com.titan.titancorebanking.dto.request.GenerateQrRequest;
 import com.titan.titancorebanking.dto.request.PayByQrRequest;
 import com.titan.titancorebanking.dto.response.QrPaymentResponse;
 import com.titan.titancorebanking.enums.TransactionStatus;
@@ -49,7 +49,10 @@ public class QrPaymentService {
     private final PasswordEncoder passwordEncoder;
     private final EventPublisherService eventPublisherService;
     private final AccountBucketService accountBucketService;
-    private final DoubleEntryService doubleEntryService;
+
+    // =============================================================================
+    // 1. GENERATE QR
+    // =============================================================================
 
     @Transactional
     public QrPaymentResponse generateQr(GenerateQrRequest request, String username) {
@@ -62,6 +65,7 @@ public class QrPaymentService {
 
         String qrToken = generateUniqueToken();
         int ttl = (request.ttlMinutes() != null) ? request.ttlMinutes() : DEFAULT_TTL_MIN;
+        LocalDateTime expiresAt = LocalDateTime.now().plusMinutes(ttl);
 
         QrPayment qrPayment = QrPayment.builder()
                 .qrCode(qrToken)
@@ -70,30 +74,51 @@ public class QrPaymentService {
                 .currency(payee.getCurrency().name())
                 .note(request.note())
                 .status(QrStatus.PENDING)
-                .expiresAt(LocalDateTime.now().plusMinutes(ttl))
+                .expiresAt(expiresAt)
                 .build();
 
         qrPaymentRepository.save(qrPayment);
-        return toResponse(qrPayment, renderQrToBase64(qrToken));
+        log.info("QR generated: token={} payee={} amount={}", qrToken, request.payeeAccountNumber(), request.amount());
+
+        String base64Image = renderQrToBase64(qrToken);
+        return toResponse(qrPayment, base64Image);
     }
+
+    // =============================================================================
+    // 2. PAY BY QR
+    // =============================================================================
 
     @Transactional
     public QrPaymentResponse payByQr(PayByQrRequest request, String username) {
+        // Step 1: Pessimistic write lock on the QR token to prevent concurrent double-scans
         QrPayment qrPayment = qrPaymentRepository.findByQrCodeWithLock(request.qrCode())
                 .orElseThrow(() -> new IllegalArgumentException("Invalid QR code."));
 
         boolean isAccountQr = "ACCOUNT_QR".equals(qrPayment.getNote());
-        validateQrState(qrPayment, isAccountQr);
+        if (qrPayment.getStatus() == QrStatus.EXPIRED ||
+                (!isAccountQr && LocalDateTime.now().isAfter(qrPayment.getExpiresAt()))) {
+            qrPayment.setStatus(QrStatus.EXPIRED);
+            qrPaymentRepository.save(qrPayment);
+            throw new IllegalStateException("QR code has expired.");
+        }
+
+        if (!isAccountQr && qrPayment.getStatus() != QrStatus.PENDING) {
+            throw new IllegalStateException("QR code has already been used.");
+        }
+
+        if (qrPayment.getStatus() == QrStatus.CANCELLED) {
+            throw new IllegalStateException("QR code has been cancelled.");
+        }
+
+        if (!isAccountQr) {
+            qrPayment.setStatus(QrStatus.COMPLETED);
+        }
 
         Account payer = accountRepository.findByAccountNumber(request.payerAccountNumber())
-                .orElseThrow(() -> new IllegalArgumentException("Payer account not found."));
+                .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + request.payerAccountNumber()));
 
         if (!payer.getUser().getUsername().equals(username)) {
             throw new SecurityException("You can only pay from your own accounts.");
-        }
-
-        if (!passwordEncoder.matches(request.pin(), payer.getUser().getPin())) {
-            throw new SecurityException("Invalid PIN.");
         }
 
         BigDecimal paymentAmount = resolveAmount(qrPayment, request);
@@ -103,19 +128,34 @@ public class QrPaymentService {
             throw new IllegalArgumentException("You cannot pay yourself via QR.");
         }
 
-        Long firstLockId = Math.min(payer.getId(), payee.getId());
-        Long secondLockId = Math.max(payer.getId(), payee.getId());
+        // Step 2: Deterministic row locking (min(id) -> max(id))
+        Long payerId = payer.getId();
+        Long payeeId = payee.getId();
+        Account payerLocked;
+        Account payeeLocked;
 
-        Account firstLocked = accountRepository.findByIdWithLock(firstLockId).orElseThrow();
-        Account secondLocked = accountRepository.findByIdWithLock(secondLockId).orElseThrow();
+        if (payerId < payeeId) {
+            payerLocked = accountRepository.findByIdWithLock(payerId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + payerId));
+            payeeLocked = accountRepository.findByIdWithLock(payeeId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payee account not found: " + payeeId));
+        } else {
+            payeeLocked = accountRepository.findByIdWithLock(payeeId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payee account not found: " + payeeId));
+            payerLocked = accountRepository.findByIdWithLock(payerId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + payerId));
+        }
 
-        Account payerLocked = payer.getId().equals(firstLocked.getId()) ? firstLocked : secondLocked;
-        Account payeeLocked = payee.getId().equals(firstLocked.getId()) ? firstLocked : secondLocked;
+        // Step 3: Verify PIN on the locked entity (prevents TOCTOU race)
+        if (!passwordEncoder.matches(request.pin(), payerLocked.getUser().getPin())) {
+            throw new SecurityException("Invalid PIN.");
+        }
 
         if (payerLocked.getBalance().compareTo(paymentAmount) < 0) {
             throw new IllegalStateException("Insufficient balance.");
         }
 
+        // Step 4: Transfer funds
         payerLocked.setBalance(payerLocked.getBalance().subtract(paymentAmount));
         accountRepository.save(payerLocked);
 
@@ -133,24 +173,34 @@ public class QrPaymentService {
                 .amount(paymentAmount)
                 .transactionType(TransactionType.PAYMENT)
                 .status(TransactionStatus.SUCCESS)
-                .note("QR Payment " + (qrPayment.getNote() != null ? qrPayment.getNote() : ""))
+                .note("QR Payment - " + (qrPayment.getNote() != null ? qrPayment.getNote() : ""))
                 .timestamp(LocalDateTime.now())
                 .transactionReference("QR-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase())
                 .build();
         transactionRepository.save(tx);
 
-        doubleEntryService.createDoubleEntry(
-                tx.getId(), payerLocked.getId(), payeeLocked.getId(), paymentAmount, tx.getNote(), username);
-
-        qrPayment.setStatus(isAccountQr ? QrStatus.PENDING : QrStatus.COMPLETED);
+        if (!isAccountQr) {
+            qrPayment.setStatus(QrStatus.COMPLETED);
+        } else {
+            qrPayment.setStatus(QrStatus.PENDING);
+        }
         qrPayment.setPayerAccount(payerLocked);
         qrPayment.setTransaction(tx);
         qrPayment.setPaidAt(LocalDateTime.now());
         qrPaymentRepository.save(qrPayment);
 
-        eventPublisherService.publishTransactionCompletedEvent(tx);
+        try {
+            eventPublisherService.publishTransactionCompletedEvent(tx);
+        } catch (Exception e) {
+            log.error("Failed to publish transaction event for QR pay: {}", e.getMessage());
+        }
+
         return toResponse(qrPayment, null);
     }
+
+    // =============================================================================
+    // 3. GENERATE PAYER QR
+    // =============================================================================
 
     @Transactional
     public QrPaymentResponse generatePayerQr(GeneratePayerQrRequest request, String username) {
@@ -165,26 +215,35 @@ public class QrPaymentService {
             throw new SecurityException("Invalid PIN.");
         }
 
-        if (payer.getBalance().compareTo(request.amount()) < 0) {
+        BigDecimal amount = request.amount();
+        if (payer.getBalance().compareTo(amount) < 0) {
             throw new IllegalStateException("Insufficient balance to generate this QR.");
         }
 
         String qrToken = generateUniqueToken();
         int ttl = (request.ttlMinutes() != null) ? request.ttlMinutes() : DEFAULT_TTL_MIN;
+        LocalDateTime expiresAt = LocalDateTime.now().plusMinutes(ttl);
 
         QrPayment qrPayment = QrPayment.builder()
                 .qrCode(qrToken)
                 .payeeAccount(payer)
-                .amount(request.amount())
+                .amount(amount)
                 .currency(payer.getCurrency().name())
                 .note("PAYER_QR:" + (request.note() != null ? request.note() : ""))
                 .status(QrStatus.PENDING)
-                .expiresAt(LocalDateTime.now().plusMinutes(ttl))
+                .expiresAt(expiresAt)
                 .build();
 
         qrPaymentRepository.save(qrPayment);
-        return toResponse(qrPayment, renderQrToBase64(qrToken));
+        log.info("Payer QR generated: token={} payer={} amount={}", qrToken, request.payerAccountNumber(), amount);
+
+        String base64Image = renderQrToBase64(qrToken);
+        return toResponse(qrPayment, base64Image);
     }
+
+    // =============================================================================
+    // 4. COLLECT BY QR
+    // =============================================================================
 
     @Transactional
     public QrPaymentResponse collectByQr(CollectByQrRequest request, String username) {
@@ -192,32 +251,53 @@ public class QrPaymentService {
                 .orElseThrow(() -> new IllegalArgumentException("Invalid QR code."));
 
         if (qrPayment.getNote() == null || !qrPayment.getNote().startsWith("PAYER_QR:")) {
-            throw new IllegalArgumentException("This QR code is not a Send-by-QR code.");
+            throw new IllegalArgumentException("This QR code is not a Send-by-QR code. Use the pay endpoint instead.");
         }
 
-        validateQrState(qrPayment, false);
+        if (qrPayment.getStatus() == QrStatus.EXPIRED || LocalDateTime.now().isAfter(qrPayment.getExpiresAt())) {
+            qrPayment.setStatus(QrStatus.EXPIRED);
+            qrPaymentRepository.save(qrPayment);
+            throw new IllegalStateException("QR code has expired.");
+        }
+
+        if (qrPayment.getStatus() != QrStatus.PENDING) {
+            throw new IllegalStateException("QR code has already been collected.");
+        }
+
+        if (qrPayment.getStatus() == QrStatus.CANCELLED) {
+            throw new IllegalStateException("QR code has been cancelled.");
+        }
+
+        qrPayment.setStatus(QrStatus.COMPLETED);
 
         Account collector = accountRepository.findByAccountNumber(request.collectorAccountNumber())
-                .orElseThrow(() -> new IllegalArgumentException("Collector account not found"));
+                .orElseThrow(() -> new IllegalArgumentException("Collector account not found: " + request.collectorAccountNumber()));
 
         if (!collector.getUser().getUsername().equals(username)) {
             throw new SecurityException("You can only collect into your own accounts.");
         }
 
         Account payer = qrPayment.getPayeeAccount();
-
         if (payer.getAccountNumber().equals(collector.getAccountNumber())) {
             throw new IllegalArgumentException("You cannot collect a QR into the same account.");
         }
 
-        Long firstLockId = Math.min(payer.getId(), collector.getId());
-        Long secondLockId = Math.max(payer.getId(), collector.getId());
+        Long payerId = payer.getId();
+        Long collectorId = collector.getId();
+        Account payerLocked;
+        Account collectorLocked;
 
-        Account firstLocked = accountRepository.findByIdWithLock(firstLockId).orElseThrow();
-        Account secondLocked = accountRepository.findByIdWithLock(secondLockId).orElseThrow();
-
-        Account payerLocked = payer.getId().equals(firstLocked.getId()) ? firstLocked : secondLocked;
-        Account collectorLocked = collector.getId().equals(firstLocked.getId()) ? firstLocked : secondLocked;
+        if (payerId < collectorId) {
+            payerLocked = accountRepository.findByIdWithLock(payerId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + payerId));
+            collectorLocked = accountRepository.findByIdWithLock(collectorId)
+                    .orElseThrow(() -> new IllegalArgumentException("Collector account not found: " + collectorId));
+        } else {
+            collectorLocked = accountRepository.findByIdWithLock(collectorId)
+                    .orElseThrow(() -> new IllegalArgumentException("Collector account not found: " + collectorId));
+            payerLocked = accountRepository.findByIdWithLock(payerId)
+                    .orElseThrow(() -> new IllegalArgumentException("Payer account not found: " + payerId));
+        }
 
         BigDecimal amount = qrPayment.getAmount();
         if (payerLocked.getBalance().compareTo(amount) < 0) {
@@ -235,13 +315,14 @@ public class QrPaymentService {
             accountRepository.save(collectorLocked);
         }
 
+        String memo = qrPayment.getNote().substring("PAYER_QR:".length());
         Transaction tx = Transaction.builder()
                 .fromAccount(payerLocked)
                 .toAccount(collectorLocked)
                 .amount(amount)
                 .transactionType(TransactionType.PAYMENT)
                 .status(TransactionStatus.SUCCESS)
-                .note("Send-by-QR")
+                .note("Send-by-QR" + (memo.isEmpty() ? "" : " - " + memo))
                 .timestamp(LocalDateTime.now())
                 .transactionReference("QR-SEND-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase())
                 .build();
@@ -254,9 +335,18 @@ public class QrPaymentService {
         qrPayment.setPayeeAccount(collectorLocked);
         qrPaymentRepository.save(qrPayment);
 
-        eventPublisherService.publishTransactionCompletedEvent(tx);
+        try {
+            eventPublisherService.publishTransactionCompletedEvent(tx);
+        } catch (Exception e) {
+            log.error("Failed to publish transaction completed event for QR collect: {}", e.getMessage());
+        }
+
         return toResponse(qrPayment, null);
     }
+
+    // =============================================================================
+    // 5. CANCEL & HISTORY & ACCOUNT QR
+    // =============================================================================
 
     @Transactional
     public QrPaymentResponse cancelQr(String qrCode, String username) {
@@ -268,7 +358,7 @@ public class QrPaymentService {
         }
 
         if (qrPayment.getStatus() != QrStatus.PENDING) {
-            throw new IllegalStateException("Only PENDING QR codes can be cancelled.");
+            throw new IllegalStateException("Only PENDING QR codes can be cancelled. Current status: " + qrPayment.getStatus());
         }
 
         qrPayment.setStatus(QrStatus.CANCELLED);
@@ -276,7 +366,6 @@ public class QrPaymentService {
         return toResponse(qrPayment, null);
     }
 
-    @Transactional(readOnly = true)
     public List<QrPaymentResponse> getQrHistory(String accountNumber, String username) {
         Account account = accountRepository.findByAccountNumber(accountNumber)
                 .orElseThrow(() -> new IllegalArgumentException("Account not found."));
@@ -286,13 +375,15 @@ public class QrPaymentService {
         }
 
         return qrPaymentRepository.findByPayeeAccount_AccountNumberOrderByCreatedAtDesc(accountNumber)
-                .stream().map(q -> toResponse(q, null)).toList();
+                .stream()
+                .map(q -> toResponse(q, null))
+                .toList();
     }
 
     @Transactional
     public QrPaymentResponse getOrCreateAccountQr(String accountNumber, String username) {
         Account account = accountRepository.findByAccountNumber(accountNumber)
-                .orElseThrow(() -> new IllegalArgumentException("Account not found"));
+                .orElseThrow(() -> new IllegalArgumentException("Account not found: " + accountNumber));
 
         if (!account.getUser().getUsername().equals(username)) {
             throw new SecurityException("You can only access QR codes for your own accounts.");
@@ -301,9 +392,11 @@ public class QrPaymentService {
         QrPayment qrPayment = qrPaymentRepository
                 .findByPayeeAccount_AccountNumberAndNote(accountNumber, "ACCOUNT_QR")
                 .orElseGet(() -> {
+                    String qrToken = generateUniqueToken();
                     QrPayment newQr = QrPayment.builder()
-                            .qrCode(generateUniqueToken())
+                            .qrCode(qrToken)
                             .payeeAccount(account)
+                            .amount(null)
                             .currency(account.getCurrency().name())
                             .note("ACCOUNT_QR")
                             .status(QrStatus.PENDING)
@@ -312,29 +405,22 @@ public class QrPaymentService {
                     return qrPaymentRepository.save(newQr);
                 });
 
-        return toResponse(qrPayment, renderQrToBase64(qrPayment.getQrCode()));
+        String base64Image = renderQrToBase64(qrPayment.getQrCode());
+        return toResponse(qrPayment, base64Image);
     }
 
     @Scheduled(fixedDelay = 60_000)
     @Transactional
     public void expireStaleQrCodes() {
-        qrPaymentRepository.expireStaleQrCodes(LocalDateTime.now());
+        int expired = qrPaymentRepository.expireStaleQrCodes(LocalDateTime.now());
+        if (expired > 0) {
+            log.info("Expired {} stale QR codes.", expired);
+        }
     }
 
-    private void validateQrState(QrPayment qrPayment, boolean isAccountQr) {
-        if (qrPayment.getStatus() == QrStatus.EXPIRED ||
-                (!isAccountQr && LocalDateTime.now().isAfter(qrPayment.getExpiresAt()))) {
-            qrPayment.setStatus(QrStatus.EXPIRED);
-            qrPaymentRepository.save(qrPayment);
-            throw new IllegalStateException("QR code has expired.");
-        }
-        if (!isAccountQr && qrPayment.getStatus() != QrStatus.PENDING) {
-            throw new IllegalStateException("QR code has already been used.");
-        }
-        if (qrPayment.getStatus() == QrStatus.CANCELLED) {
-            throw new IllegalStateException("QR code has been cancelled.");
-        }
-    }
+    // =============================================================================
+    // PRIVATE UTILS
+    // =============================================================================
 
     private String generateUniqueToken() {
         String token;
@@ -356,22 +442,35 @@ public class QrPaymentService {
             MatrixToImageWriter.writeToStream(matrix, "PNG", out);
             return Base64.getEncoder().encodeToString(out.toByteArray());
         } catch (Exception e) {
+            log.error("Failed to render QR image", e);
             throw new RuntimeException("QR image generation failed.", e);
         }
     }
 
     private BigDecimal resolveAmount(QrPayment qrPayment, PayByQrRequest request) {
-        if (qrPayment.getAmount() != null) return qrPayment.getAmount();
-        if (request.amount() == null) throw new IllegalArgumentException("This QR code requires an amount.");
+        if (qrPayment.getAmount() != null) {
+            return qrPayment.getAmount();
+        }
+        if (request.amount() == null) {
+            throw new IllegalArgumentException("This QR code requires you to specify an amount.");
+        }
         return request.amount();
     }
 
     private QrPaymentResponse toResponse(QrPayment q, String base64Image) {
         return new QrPaymentResponse(
-                q.getId(), q.getQrCode(), base64Image, q.getStatus().name(),
-                q.getAmount(), q.getCurrency(), q.getPayeeAccount().getAccountNumber(),
+                q.getId(),
+                q.getQrCode(),
+                base64Image,
+                q.getStatus().name(),
+                q.getAmount(),
+                q.getCurrency(),
+                q.getPayeeAccount().getAccountNumber(),
                 q.getPayerAccount() != null ? q.getPayerAccount().getAccountNumber() : null,
-                q.getNote(), q.getCreatedAt(), q.getExpiresAt(), q.getPaidAt(),
+                q.getNote(),
+                q.getCreatedAt(),
+                q.getExpiresAt(),
+                q.getPaidAt(),
                 q.getTransaction() != null ? q.getTransaction().getId() : null
         );
     }
