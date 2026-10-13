@@ -1,25 +1,23 @@
 package com.titan.titancorebanking.aiops;
 
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestClient;
+import org.springframework.web.reactive.function.client.WebClient;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
-/**
- * Modernized AIOps Auto-Scaler.
- * Migrated from WebClient.block() to RestClient. When running on Java 21,
- * this allows the @Scheduled task to yield smoothly if virtual threads are enabled
- * for scheduling, preventing thread pinning issues associated with reactive wrappers.
- */
 @Service
+@RequiredArgsConstructor
 @Slf4j
 public class PredictiveAutoScaler {
 
-    private final RestClient restClient;
+    private final WebClient.Builder webClientBuilder;
 
     @Value("${aiops.prometheus.url:http://localhost:9090}")
     private String prometheusUrl;
@@ -39,28 +37,28 @@ public class PredictiveAutoScaler {
     @Value("${aiops.scale.max-replicas:20}")
     private int maxReplicas;
 
-    private final Deque<Double> tpsHistory = new ArrayDeque<>(30);
-
-    public PredictiveAutoScaler(RestClient.Builder restClientBuilder) {
-        this.restClient = restClientBuilder.build();
-    }
+    // STAFF ENGINEER FIX: Thread-safe deque
+    private final Deque<Double> tpsHistory = new ConcurrentLinkedDeque<>();
 
     @Scheduled(fixedDelay = 60_000)
     public void evaluateAndScale() {
         double currentTps = fetchCurrentTps();
         tpsHistory.addLast(currentTps);
 
-        if (tpsHistory.size() > 30) tpsHistory.pollFirst();
+        while (tpsHistory.size() > 30) {
+            tpsHistory.pollFirst();
+        }
+
         if (tpsHistory.size() < 5) return;
 
         double predictedTps = predict();
         int requiredReplicas = calculateReplicas(predictedTps);
 
-        log.info("AIOps: currentTPS={:.1f}, predictedTPS={:.1f}, requiredReplicas={}",
+        log.debug("AIOps: currentTPS={:.1f}, predictedTPS={:.1f}, requiredReplicas={}",
                 currentTps, predictedTps, requiredReplicas);
 
         if (predictedTps > tpsThreshold) {
-            log.warn("  AIOps: Spike predicted! Pre-scaling {} to {} replicas", deploymentName, requiredReplicas);
+            log.warn("AIOps Spike Predicted! Pre-scaling {} to {} replicas", deploymentName, requiredReplicas);
             patchHpa(requiredReplicas);
         }
     }
@@ -76,8 +74,8 @@ public class PredictiveAutoScaler {
             weightedSum += samples.get(i) * weight;
             totalWeight += weight;
         }
-
         double wma = weightedSum / totalWeight;
+
         int hour = LocalDateTime.now().getHour();
         double seasonality = (hour >= 11 && hour <= 13) || (hour >= 17 && hour <= 19) ? 1.4 : 1.0;
 
@@ -87,6 +85,7 @@ public class PredictiveAutoScaler {
             double older = samples.subList(Math.max(0, n - 10), n - 5).stream().mapToDouble(Double::doubleValue).average().orElse(recent);
             trend = (recent - older) * 2;
         }
+
         return (wma + trend) * seasonality;
     }
 
@@ -98,21 +97,30 @@ public class PredictiveAutoScaler {
     private double fetchCurrentTps() {
         try {
             String query = "sum(rate(kafka_consumer_fetch_manager_records_consumed_total{topic=\"banking.transactions.completed\"}[1m]))";
-            Map response = restClient.get()
-                    .uri(prometheusUrl + "/api/v1/query?query={query}", query)
+
+            // STAFF ENGINEER FIX: Added 3-second hard timeout
+            Map<?, ?> response = webClientBuilder.baseUrl(prometheusUrl).build()
+                    .get()
+                    .uri("/api/v1/query?query={query}", query)
                     .retrieve()
-                    .body(Map.class);
+                    .bodyToMono(Map.class)
+                    .timeout(Duration.ofSeconds(3))
+                    .block();
 
             if (response != null) {
                 var data = (Map<?, ?>) response.get("data");
-                var result = (List<?>) data.get("result");
-                if (!result.isEmpty()) {
-                    var value = (List<?>) ((Map<?, ?>) result.get(0)).get("value");
-                    return Double.parseDouble((String) value.get(1));
+                if (data != null) {
+                    var result = (List<?>) data.get("result");
+                    if (result != null && !result.isEmpty()) {
+                        var value = (List<?>) ((Map<?, ?>) result.get(0)).get("value");
+                        if (value != null && value.size() > 1) {
+                            return Double.parseDouble(value.get(1).toString());
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
-            log.debug("Prometheus fetch failed, using simulated TPS", e);
+            log.debug("Prometheus fetch failed, using fallback TPS logic: {}", e.getMessage());
         }
 
         int hour = LocalDateTime.now().getHour();
@@ -122,15 +130,18 @@ public class PredictiveAutoScaler {
     private void patchHpa(int replicas) {
         String patchBody = String.format("{\"spec\":{\"minReplicas\":%d,\"maxReplicas\":%d}}", replicas, maxReplicas);
         try {
-            restClient.patch()
-                    .uri(k8sApiUrl + "/apis/autoscaling/v1/namespaces/{ns}/horizontalpodautoscalers/{name}", namespace, deploymentName)
+            webClientBuilder.baseUrl(k8sApiUrl).build()
+                    .patch()
+                    .uri("/apis/autoscaling/v1/namespaces/{ns}/horizontalpodautoscalers/{name}", namespace, deploymentName)
                     .header("Content-Type", "application/merge-patch+json")
-                    .body(patchBody)
+                    .bodyValue(patchBody)
                     .retrieve()
-                    .toBodilessEntity();
-            log.info("  HPA patched: {} replicas for {}", replicas, deploymentName);
+                    .bodyToMono(String.class)
+                    .timeout(Duration.ofSeconds(5))
+                    .block();
+            log.info("HPA patched: {} replicas for {}", replicas, deploymentName);
         } catch (Exception e) {
-            log.error("HPA patch failed", e);
+            log.error("HPA patch failed: {}", e.getMessage());
         }
     }
 }
