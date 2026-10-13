@@ -13,9 +13,8 @@ import com.titan.titancorebanking.repository.TransactionRepository;
 import com.titan.titancorebanking.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
-import org.springframework.data.domain.Sort;
+import org.springframework.data.domain.Slice;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -46,53 +45,48 @@ public class BatchScheduler {
 
     @Scheduled(cron = "${banking.scheduler.interest-cron:0 0 0 * * ?}", zone = "Asia/Phnom_Penh")
     public void runInterestCalculationJob() {
-        log.info("  [BatchScheduler] Starting Daily Interest Calculation Batch...");
+        log.info("[BatchScheduler] Starting Daily Interest Calculation Batch...");
         long startTime = System.currentTimeMillis();
-
+        int pageNumber = 0;
         int processedCount = 0;
         int interestAppliedCount = 0;
-        Long lastProcessedId = 0L;
 
         try {
             Account glAccount = getOrCreateInterestExpenseGlAccount();
-            Page<Account> accountPage;
+            Slice<Account> accountSlice;
 
-            // Use keyset pagination (seek method) instead of offset pagination to prevent missed
-            // records during concurrent modifications and provide safe resumption points.
             do {
-                accountPage = accountRepository.findByIdGreaterThanOrderByIdAsc(
-                        lastProcessedId,
-                        PageRequest.of(0, PAGE_SIZE)
+                // Fetch only eligible accounts at the DB level
+                accountSlice = accountRepository.findByBalanceGreaterThan(
+                        BigDecimal.ZERO,
+                        PageRequest.of(pageNumber, PAGE_SIZE)
                 );
 
-                for (Account account : accountPage.getContent()) {
-                    lastProcessedId = account.getId();
-                    processedCount++;
-
-                    if (account.getId().equals(glAccount.getId()) ||
-                            account.getBalance() == null ||
-                            account.getBalance().compareTo(BigDecimal.ZERO) <= 0) {
+                for (Account account : accountSlice.getContent()) {
+                    if (account.getId().equals(glAccount.getId())) {
                         continue;
                     }
 
-                    boolean applied = processInterestForAccountSafe(account.getId(), glAccount.getId());
+                    processedCount++;
+                    boolean applied = processInterestForAccount(account.getId(), glAccount.getId());
                     if (applied) {
                         interestAppliedCount++;
                     }
                 }
-            } while (accountPage.hasNext());
+                pageNumber++;
+            } while (accountSlice.hasNext());
 
             long duration = System.currentTimeMillis() - startTime;
-            log.info("  [BatchScheduler] Interest Batch Finished in {} ms. Processed: {} accounts, Interest Applied: {}",
+            log.info("[BatchScheduler] Interest Batch Finished in {} ms. Evaluated: {}, Interest Applied: {}",
                     duration, processedCount, interestAppliedCount);
 
         } catch (Exception e) {
-            log.error("  [BatchScheduler] Daily Interest Batch failed catastrophically at ID {}: ", lastProcessedId, e);
+            log.error("[BatchScheduler] Daily Interest Batch failed catastrophically: ", e);
         }
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public boolean processInterestForAccountSafe(Long customerAccountId, Long glAccountId) {
+    public boolean processInterestForAccount(Long customerAccountId, Long glAccountId) {
         try {
             Long firstId = Math.min(customerAccountId, glAccountId);
             Long secondId = Math.max(customerAccountId, glAccountId);
@@ -105,6 +99,7 @@ public class BatchScheduler {
             Account glLocked = glAccountId.equals(firstLocked.getId()) ? firstLocked : secondLocked;
             Account customerLocked = customerAccountId.equals(firstLocked.getId()) ? firstLocked : secondLocked;
 
+            // Double check inside the lock
             if (customerLocked.getBalance().compareTo(BigDecimal.ZERO) <= 0) {
                 return false;
             }
@@ -125,12 +120,6 @@ public class BatchScheduler {
             accountRepository.save(customerLocked);
 
             LocalDateTime now = LocalDateTime.now();
-            String idempotencyKey = "INT-" + now.toLocalDate() + "-" + customerLocked.getId();
-
-            // Prevent duplicate interest payouts if the batch restarts
-            if (transactionRepository.findByIdempotencyKey(idempotencyKey).isPresent()) {
-                return false;
-            }
 
             Transaction tx = Transaction.builder()
                     .fromAccount(glLocked)
@@ -138,10 +127,9 @@ public class BatchScheduler {
                     .amount(dailyInterest)
                     .transactionType(TransactionType.INTEREST)
                     .status(TransactionStatus.SUCCESS)
-                    .note("Daily Interest Payout")
+                    .note("Daily Interest Payout (" + (customerLocked.getAccountType() != null ? customerLocked.getAccountType() : "SAVINGS") + ")")
                     .timestamp(now)
                     .transactionReference("INT-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase())
-                    .idempotencyKey(idempotencyKey)
                     .build();
             transactionRepository.save(tx);
 
@@ -169,7 +157,6 @@ public class BatchScheduler {
             ledgerRepository.save(creditCustomerEntry);
 
             return true;
-
         } catch (Exception e) {
             log.error("Failed to apply interest for account ID {}: {}", customerAccountId, e.getMessage());
             return false;
