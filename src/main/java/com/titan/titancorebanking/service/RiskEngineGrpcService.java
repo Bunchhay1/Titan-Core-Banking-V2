@@ -1,6 +1,5 @@
 package com.titan.titancorebanking.service;
 
-import io.github.resilience4j.bulkhead.annotation.Bulkhead;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,11 +27,9 @@ public class RiskEngineGrpcService {
     }
 
     /**
-     * Executes the gRPC call with both a CircuitBreaker (fail-open) and a Bulkhead (concurrency limit).
-     * The Bulkhead ensures that even if the gRPC channel hangs before the deadline,
-     * it cannot consume all available virtual threads.
+     * Calls the external AI Risk Engine over gRPC before any DB locks are acquired.
+     * Enforces a strict deadline and uses a Circuit Breaker to prevent cascading failures.
      */
-    @Bulkhead(name = "risk-engine", fallbackMethod = "fallbackRiskCheckBulkhead")
     @CircuitBreaker(name = "risk-engine", fallbackMethod = "fallbackRiskCheck")
     public RiskCheckResponse analyzeTransaction(String userId, double amount) {
         log.debug("Calling AI Risk Engine | User: {} | Amount: ${}", userId, amount);
@@ -42,24 +39,21 @@ public class RiskEngineGrpcService {
                 .setAmount(amount)
                 .build();
 
+        // STAFF ENGINEER FIX: Hard deadline prevents thread exhaustion during network degradation
         return riskStub
                 .withDeadlineAfter(deadlineMs, TimeUnit.MILLISECONDS)
                 .checkRisk(request);
     }
 
-    public RiskCheckResponse fallbackRiskCheckBulkhead(String userId, double amount, io.github.resilience4j.bulkhead.BulkheadFullException e) {
-        log.warn("Risk Engine Bulkhead FULL. applying local fallback for user {}.", userId);
-        return applyLocalFallback(userId, amount);
-    }
-
+    /**
+     * Fallback strategy executed automatically when Circuit Breaker opens or Deadline is exceeded.
+     * Implements a "Fail-Open" policy for low amounts and a local heuristic block for high amounts.
+     */
     public RiskCheckResponse fallbackRiskCheck(String userId, double amount, Throwable t) {
-        log.debug("AI Service unreachable: {}. Using local fallback.", t.getMessage());
-        return applyLocalFallback(userId, amount);
-    }
+        log.warn("AI Service degraded or unreachable ({}). Applying local fallback rules for User: {}", t.getMessage(), userId);
 
-    private RiskCheckResponse applyLocalFallback(String userId, double amount) {
         if (amount >= localBlockLimit) {
-            log.warn("  LOCAL BLOCK | User: {} | Amount: ${} >= limit${}", userId, amount, localBlockLimit);
+            log.warn("LOCAL HEURISTIC BLOCK | User: {} | Amount: ${} exceeds limit ${}", userId, amount, localBlockLimit);
             return RiskCheckResponse.newBuilder()
                     .setRiskScore(100)
                     .setRiskLevel("BLOCKED")
@@ -67,9 +61,10 @@ public class RiskEngineGrpcService {
                     .build();
         }
 
+        // Fail-Open for standard transactions to maintain system availability
         return RiskCheckResponse.newBuilder()
                 .setRiskScore(0)
-                .setRiskLevel("UNKNOWN")
+                .setRiskLevel("UNKNOWN_ALLOWED")
                 .setAction("MANUAL_REVIEW")
                 .build();
     }
