@@ -10,6 +10,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -69,8 +73,20 @@ public class ScheduledTransactionService {
                 "SCHED-" + st.getId() + "-" + executionTime.toLocalDate()
         );
 
-        // Execute transfer bypassing PIN but enforcing all other risk and lock rules
-        transactionService.executeSecureTransfer(req, fromAccount.getUser().getUsername());
+        // Execute transfer bypassing PIN but enforcing all other risk and lock rules under ROLE_SYSTEM
+        Authentication previousAuth = SecurityContextHolder.getContext().getAuthentication();
+        try {
+            SecurityContextHolder.getContext().setAuthentication(
+                    new UsernamePasswordAuthenticationToken(
+                            "SYSTEM_SCHEDULER",
+                            null,
+                            List.of(new SimpleGrantedAuthority("ROLE_SYSTEM"))
+                    )
+            );
+            transactionService.executeScheduledTransfer(req, fromAccount.getUser().getUsername());
+        } finally {
+            SecurityContextHolder.getContext().setAuthentication(previousAuth);
+        }
 
         // Calculate next execution date based on frequency
         LocalDateTime nextDate = calculateNextExecution(executionTime, st.getFrequency());
