@@ -1,24 +1,25 @@
 package com.titan.titancorebanking.controller;
 
-import java.util.Map;
 import com.titan.titancorebanking.dto.request.TransactionRequest;
 import com.titan.titancorebanking.dto.response.TransactionResponse;
-import com.titan.titancorebanking.model.Transaction;
 import com.titan.titancorebanking.service.TransactionService;
+import com.titan.titancorebanking.utils.PaginationUtils;
 import io.github.resilience4j.bulkhead.annotation.Bulkhead;
 import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.*;
 
-
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
@@ -38,12 +39,12 @@ public class TransactionController {
     private static final Pattern IBAN_PATTERN = Pattern.compile("^[A-Z]{2}\\d{2}[A-Z0-9]{4,30}$");
 
     @PostMapping("/transfer")
+    @PreAuthorize("isAuthenticated()")
     @RateLimiter(name = "financial-operations")
     @Operation(summary = "Execute Fund Transfer", description = "Transfers money between accounts safely.")
     public ResponseEntity<TransactionResponse> transfer(
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
-            @RequestBody TransactionRequest request,
-            @AuthenticationPrincipal UserDetails userDetails) {
+            @RequestBody TransactionRequest request) {
 
         // Inject idempotency key from header into request context if present
         TransactionRequest enrichedRequest = idempotencyKey != null
@@ -51,24 +52,25 @@ public class TransactionController {
                 : request;
 
         log.info("Transfer Request: {} -> {}", enrichedRequest.fromAccountNumber(), enrichedRequest.toAccountNumber());
-        Transaction tx = transactionService.transfer(enrichedRequest, userDetails.getUsername());
-        return ResponseEntity.ok(toTransactionResponse(tx));
+        TransactionResponse response = transactionService.transfer(enrichedRequest);
+        return ResponseEntity.ok(response);
     }
 
     @PostMapping("/withdraw")
+    @PreAuthorize("isAuthenticated()")
     @RateLimiter(name = "financial-operations")
     @Operation(summary = "Withdraw Money", description = "Deducts balance from account.")
     public ResponseEntity<TransactionResponse> withdraw(
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
-            @RequestBody TransactionRequest request,
-            @AuthenticationPrincipal UserDetails userDetails) {
+            @RequestBody TransactionRequest request) {
 
         TransactionRequest enrichedRequest = idempotencyKey != null ? request.withIdempotencyKey(idempotencyKey) : request;
-        Transaction tx = transactionService.withdraw(enrichedRequest, userDetails.getUsername());
-        return ResponseEntity.ok(toTransactionResponse(tx));
+        TransactionResponse response = transactionService.withdraw(enrichedRequest);
+        return ResponseEntity.ok(response);
     }
 
     @PostMapping("/deposit")
+    @PreAuthorize("isAuthenticated()")
     @RateLimiter(name = "financial-operations")
     @Operation(summary = "Deposit Money", description = "Adds balance to account.")
     public ResponseEntity<TransactionResponse> deposit(
@@ -76,8 +78,8 @@ public class TransactionController {
             @RequestBody TransactionRequest request) {
 
         TransactionRequest enrichedRequest = idempotencyKey != null ? request.withIdempotencyKey(idempotencyKey) : request;
-        Transaction tx = transactionService.deposit(enrichedRequest);
-        return ResponseEntity.ok(toTransactionResponse(tx));
+        TransactionResponse response = transactionService.deposit(enrichedRequest);
+        return ResponseEntity.ok(response);
     }
 
     @PostMapping("/international")
@@ -101,35 +103,21 @@ public class TransactionController {
 
     @GetMapping
     @Bulkhead(name = "non-critical", fallbackMethod = "getHistoryFallback")
-    @Operation(summary = "Get Transaction History", description = "Returns all transactions for logged-in user.")
-    public ResponseEntity<List<TransactionResponse>> getHistory(@AuthenticationPrincipal UserDetails userDetails) {
-        return ResponseEntity.ok(transactionService.getTransactionHistory(userDetails.getUsername()));
+    @Operation(summary = "Get Transaction History", description = "Returns all transactions for logged-in user with optional pagination.")
+    public ResponseEntity<List<TransactionResponse>> getHistory(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @RequestParam(name = "page", required = false) Integer page,
+            @RequestParam(name = "size", required = false) Integer size) {
+        String username = userDetails != null ? userDetails.getUsername() : null;
+        if (page != null || size != null) {
+            Pageable pageable = PaginationUtils.of(page, size);
+            return ResponseEntity.ok(transactionService.getTransactionHistory(username, pageable).getContent());
+        }
+        return ResponseEntity.ok(transactionService.getTransactionHistory(username));
     }
 
     public ResponseEntity<List<TransactionResponse>> getHistoryFallback(UserDetails userDetails, Exception e) {
-        log.warn("History request rejected for {} - system at capacity", userDetails.getUsername());
+        log.warn("History request rejected for {} - system at capacity", userDetails != null ? userDetails.getUsername() : "UNKNOWN");
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build();
-    }
-
-    private TransactionResponse toTransactionResponse(Transaction tx) {
-        String currency = tx.getFromAccount() != null && tx.getFromAccount().getCurrency() != null
-                ? tx.getFromAccount().getCurrency().name()
-                : (tx.getToAccount() != null && tx.getToAccount().getCurrency() != null
-                ? tx.getToAccount().getCurrency().name()
-                : "USD");
-
-        return new TransactionResponse(
-                tx.getId(),
-                tx.getTransactionType().name(),
-                tx.getAmount(),
-                tx.getFromAccount() != null ? tx.getFromAccount().getAccountNumber() : null,
-                tx.getToAccount() != null ? tx.getToAccount().getAccountNumber() : null,
-                tx.getStatus().name(),
-                tx.getNote(),
-                tx.getTimestamp(),
-                currency,
-                tx.getFee() != null ? tx.getFee() : java.math.BigDecimal.ZERO,
-                tx.getTransactionReference()
-        );
     }
 }
