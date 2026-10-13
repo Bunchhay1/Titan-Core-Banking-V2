@@ -1,6 +1,9 @@
 package com.titan.titancorebanking.repository;
 
 import com.titan.titancorebanking.model.Transaction;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -14,18 +17,36 @@ import java.util.Optional;
 @Repository
 public interface TransactionRepository extends JpaRepository<Transaction, Long> {
 
+    @EntityGraph(attributePaths = {"fromAccount", "toAccount", "fromAccount.user", "toAccount.user"})
     Optional<Transaction> findByIdempotencyKey(String idempotencyKey);
 
     boolean existsByIdempotencyKey(String idempotencyKey);
 
     Optional<Transaction> findByTransactionReference(String transactionReference);
 
+    List<Transaction> findByFromAccountIdAndStatus(Long fromAccountId, com.titan.titancorebanking.enums.TransactionStatus status);
+
+    @Query(value = """
+        SELECT t FROM Transaction t
+        LEFT JOIN FETCH t.fromAccount fa
+        LEFT JOIN FETCH t.toAccount ta
+        WHERE (fa.user.username = :username OR ta.user.username = :username)
+        ORDER BY t.timestamp DESC, t.id DESC
+    """,
+    countQuery = """
+        SELECT COUNT(t) FROM Transaction t
+        LEFT JOIN t.fromAccount fa
+        LEFT JOIN t.toAccount ta
+        WHERE (fa.user.username = :username OR ta.user.username = :username)
+    """)
+    Page<Transaction> findAllByUser(@Param("username") String username, Pageable pageable);
+
     @Query("""
         SELECT t FROM Transaction t
         LEFT JOIN FETCH t.fromAccount fa
         LEFT JOIN FETCH t.toAccount ta
         WHERE (fa.user.username = :username OR ta.user.username = :username)
-        ORDER BY t.timestamp DESC
+        ORDER BY t.timestamp DESC, t.id DESC
     """)
     List<Transaction> findAllByUser(@Param("username") String username);
 
@@ -39,7 +60,7 @@ public interface TransactionRepository extends JpaRepository<Transaction, Long> 
         LEFT JOIN FETCH t.fromAccount fa
         LEFT JOIN FETCH t.toAccount ta
         WHERE (fa.user.username = :username OR ta.user.username = :username)
-        ORDER BY t.timestamp DESC
+        ORDER BY t.timestamp DESC, t.id DESC
         LIMIT 1
     """)
     Optional<Transaction> findLatestByUser(@Param("username") String username);
