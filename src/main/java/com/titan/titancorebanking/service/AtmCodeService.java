@@ -36,20 +36,17 @@ public class AtmCodeService {
     private final PasswordEncoder passwordEncoder;
     private final TransactionAuditService auditService;
     private final EventPublisherService eventPublisherService;
-    private final DoubleEntryService doubleEntryService;
 
     public AtmCodeService(AtmCodeRepository atmCodeRepository,
                           AccountRepository accountRepository,
                           PasswordEncoder passwordEncoder,
                           TransactionAuditService auditService,
-                          EventPublisherService eventPublisherService,
-                          DoubleEntryService doubleEntryService) {
+                          EventPublisherService eventPublisherService) {
         this.atmCodeRepository = atmCodeRepository;
         this.accountRepository = accountRepository;
         this.passwordEncoder = passwordEncoder;
         this.auditService = auditService;
         this.eventPublisherService = eventPublisherService;
-        this.doubleEntryService = doubleEntryService;
     }
 
     @Transactional
@@ -58,22 +55,24 @@ public class AtmCodeService {
                 .orElseThrow(() -> new RuntimeException("Account not found: " + request.accountNumber()));
 
         if (!account.getUser().getUsername().equals(currentUsername)) {
-            throw new SecurityException("  You do not own this account");
+            throw new SecurityException("You do not own this account");
         }
 
         if (!passwordEncoder.matches(request.pin(), account.getUser().getPin())) {
-            throw new SecurityException("  Invalid PIN");
+            throw new SecurityException("Invalid PIN");
         }
 
         if (account.getBalance().compareTo(request.amount()) < 0) {
-            throw new IllegalStateException("  Insufficient balance for this ATM withdrawal");
+            throw new RuntimeException("Insufficient balance for this ATM withdrawal");
         }
 
         List<AtmCode> pending = atmCodeRepository.findByAccount_IdAndStatus(
                 account.getId(), AtmCodeStatus.PENDING);
+
         if (!pending.isEmpty()) {
             pending.forEach(c -> c.setStatus(AtmCodeStatus.CANCELLED));
             atmCodeRepository.saveAll(pending);
+            log.info("Cancelled {} existing pending ATM code(s) for account {}", pending.size(), account.getAccountNumber());
         }
 
         String code = generateSecure12DigitCode();
@@ -85,40 +84,49 @@ public class AtmCodeService {
                 .status(AtmCodeStatus.PENDING)
                 .expiresAt(LocalDateTime.now().plusMinutes(codeExpiryMinutes))
                 .build();
-        atmCode = atmCodeRepository.save(atmCode);
 
-        return toResponse(atmCode, "Code generated. Valid for " + codeExpiryMinutes + " minutes.");
+        atmCode = atmCodeRepository.save(atmCode);
+        log.info("ATM code generated for account={} expires={}", account.getAccountNumber(), atmCode.getExpiresAt());
+
+        return toResponse(atmCode, "Code generated. Valid for " + codeExpiryMinutes + " minutes. Do not share this code.");
     }
 
     @Transactional
     public AtmCodeResponse redeemCode(AtmRedeemRequest request) {
-        // Lock the ATM code row FIRST
-        AtmCode atmCode = atmCodeRepository.findByCodeWithLock(request.code())
-                .orElseThrow(() -> new IllegalArgumentException("  Invalid ATM code"));
+        // STAFF ENGINEER FIX: Lock Upgrade Pattern to prevent Deadlocks
+        // 1. Read without lock to identify the parent Account
+        AtmCode unverifiedCode = atmCodeRepository.findByCode(request.code())
+                .orElseThrow(() -> new RuntimeException("Invalid ATM code"));
 
-        if (atmCode.getStatus() != AtmCodeStatus.PENDING) {
-            throw new IllegalStateException("  This code is " + atmCode.getStatus().name());
+        // 2. Lock the higher-hierarchy resource FIRST (The Account)
+        Account account = accountRepository.findByAccountNumberWithLock(
+                        unverifiedCode.getAccount().getAccountNumber())
+                .orElseThrow(() -> new RuntimeException("Account not found"));
+
+        // 3. Lock the lower-hierarchy resource SECOND (The AtmCode) and re-verify state
+        AtmCode atmCode = atmCodeRepository.findByCodeWithLock(request.code())
+                .orElseThrow(() -> new RuntimeException("Invalid ATM code"));
+
+        switch (atmCode.getStatus()) {
+            case USED      -> throw new RuntimeException("This code has already been used");
+            case EXPIRED   -> throw new RuntimeException("This code has expired");
+            case CANCELLED -> throw new RuntimeException("This code was cancelled");
+            case PENDING   -> { /* Proceed */ }
         }
 
         if (LocalDateTime.now().isAfter(atmCode.getExpiresAt())) {
             atmCode.setStatus(AtmCodeStatus.EXPIRED);
             atmCodeRepository.save(atmCode);
-            throw new IllegalStateException("  This code has expired");
+            throw new RuntimeException("This code has expired");
         }
-
-        // Lock the associated Account row SECOND
-        Account account = accountRepository.findByAccountNumberWithLock(atmCode.getAccount().getAccountNumber())
-                .orElseThrow(() -> new RuntimeException("Account not found"));
 
         if (account.getBalance().compareTo(atmCode.getAmount()) < 0) {
-            throw new IllegalStateException("  Insufficient funds at time of redemption");
+            throw new RuntimeException("Insufficient funds at time of redemption");
         }
 
-        // Deduct
         account.setBalance(account.getBalance().subtract(atmCode.getAmount()));
         accountRepository.save(account);
 
-        // Finalize Code State
         atmCode.setStatus(AtmCodeStatus.USED);
         atmCode.setRedeemedAt(LocalDateTime.now());
         atmCode.setAtmTerminalId(request.terminalId());
@@ -127,12 +135,12 @@ public class AtmCodeService {
         Transaction tx = auditService.saveAuditLog(
                 account, null, atmCode.getAmount(),
                 TransactionType.WITHDRAWAL, TransactionStatus.SUCCESS,
-                "ATM cardless withdrawal | code=" + atmCode.getCode() + " | terminal=" + request.terminalId());
-
-        // Assuming ID 3 is the ATM Vault GL Account
-        doubleEntryService.createDoubleEntry(tx.getId(), account.getId(), 3L, atmCode.getAmount(), tx.getNote(), "SYSTEM_ATM");
+                "ATM cardless withdrawal | terminal=" + request.terminalId());
 
         eventPublisherService.publishTransactionCompletedEvent(tx);
+
+        log.info("ATM withdrawal OK | account={} amount={} terminal={}",
+                account.getAccountNumber(), atmCode.getAmount(), request.terminalId());
 
         return toResponse(atmCode, "Withdrawal successful. Cash has been dispensed.");
     }
@@ -140,45 +148,56 @@ public class AtmCodeService {
     @Transactional
     public AtmCodeResponse cancelCode(String code, String currentUsername) {
         AtmCode atmCode = atmCodeRepository.findByCode(code)
-                .orElseThrow(() -> new RuntimeException("  ATM code not found"));
+                .orElseThrow(() -> new RuntimeException("ATM code not found"));
 
         if (!atmCode.getAccount().getUser().getUsername().equals(currentUsername)) {
-            throw new SecurityException("  You do not own this code");
+            throw new SecurityException("You do not own this code");
         }
 
         if (atmCode.getStatus() != AtmCodeStatus.PENDING) {
-            throw new IllegalStateException("Only PENDING codes can be cancelled.");
+            throw new RuntimeException("Only PENDING codes can be cancelled");
         }
 
         atmCode.setStatus(AtmCodeStatus.CANCELLED);
         atmCodeRepository.save(atmCode);
-
         return toResponse(atmCode, "ATM code cancelled successfully.");
     }
 
     @Transactional(readOnly = true)
     public AtmCodeResponse getCodeStatus(String code, String currentUsername) {
         AtmCode atmCode = atmCodeRepository.findByCode(code)
-                .orElseThrow(() -> new RuntimeException("  ATM code not found"));
+                .orElseThrow(() -> new RuntimeException("ATM code not found"));
 
         if (!atmCode.getAccount().getUser().getUsername().equals(currentUsername)) {
-            throw new SecurityException("  You do not own this code");
+            throw new SecurityException("You do not own this code");
         }
 
-        return toResponse(atmCode, "Status: " + atmCode.getStatus());
+        String message = switch (atmCode.getStatus()) {
+            case PENDING   -> "Code is valid. Expires at: " + atmCode.getExpiresAt();
+            case USED      -> "Code was successfully redeemed.";
+            case EXPIRED   -> "Code has expired.";
+            case CANCELLED -> "Code was cancelled.";
+        };
+
+        return toResponse(atmCode, message);
     }
 
     @Scheduled(fixedDelay = 60_000)
     @Transactional
     public void expireOldCodes() {
-        atmCodeRepository.expirePendingCodes(LocalDateTime.now());
+        int expired = atmCodeRepository.expirePendingCodes(LocalDateTime.now());
+        if (expired > 0) {
+            log.info("Expired {} stale ATM code(s)", expired);
+        }
     }
 
     private String generateSecure12DigitCode() {
         String code;
         int attempts = 0;
         do {
-            if (++attempts > 10) throw new IllegalStateException("System busy");
+            if (++attempts > 10) {
+                throw new IllegalStateException("Unable to generate a unique ATM code after 10 attempts");
+            }
             int first = 1 + SECURE_RANDOM.nextInt(9);
             StringBuilder sb = new StringBuilder(12).append(first);
             for (int i = 1; i < 12; i++) {
