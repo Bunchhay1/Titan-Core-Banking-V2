@@ -1,45 +1,70 @@
 package com.titan.titancorebanking.service.imple;
 
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.time.Duration;
 
 @Service
+@RequiredArgsConstructor
 @Slf4j
 public class OtpService {
 
-    // Simple in-memory storage for OTPs (Username -> OTP)
-    // In production, use Redis!
-    private final Map<String, String> otpStorage = new ConcurrentHashMap<>();
+    private final StringRedisTemplate redisTemplate;
+
+    private static final String OTP_PREFIX = "auth:otp:";
+    private static final String RATE_LIMIT_PREFIX = "auth:otp:ratelimit:";
+    private static final Duration OTP_VALIDITY = Duration.ofMinutes(5);
+    private static final Duration RATE_LIMIT_WINDOW = Duration.ofMinutes(1);
 
     public String generateOtp(String username) {
         if (username == null || username.isBlank()) {
             throw new IllegalArgumentException("Username is required for OTP generation");
         }
-        String otp;
 
-        // WHITE-LIST LOGIC: Test accounts get fixed OTP for CI/CD automation
-        if (username.startsWith("titan_test_") || username.startsWith("intellij_test")) {
-            otp = "123456";
-            log.info("  TEST ACCOUNT DETECTED: [{}] - Using fixed OTP for automation", username);
-        } else {
-            // Production: Generate random 6-digit OTP
-            otp = String.format("%06d", (int)(Math.random() * 1000000));
-            log.info("  OTP Generated for [{}]: {}", username, otp);
+        // Prevent SMS/Email bombing: Max 1 OTP generation per minute per user
+        String rateLimitKey = RATE_LIMIT_PREFIX + username;
+        Boolean isRateLimited = redisTemplate.opsForValue().setIfAbsent(rateLimitKey, "LOCKED", RATE_LIMIT_WINDOW);
+        if (Boolean.FALSE.equals(isRateLimited)) {
+            throw new IllegalStateException("Please wait before requesting another OTP.");
         }
 
-        otpStorage.put(username, otp);
+        String otp;
+        if (username.startsWith("titan_test_") || username.startsWith("intellij_test")) {
+            otp = "123456";
+            log.debug("TEST ACCOUNT DETECTED: [{}] - Using fixed OTP", username);
+        } else {
+            // Cryptographically secure random 6-digit OTP
+            otp = String.format("%06d", new java.security.SecureRandom().nextInt(1_000_000));
+            log.debug("OTP Generated for [{}]", username); // NEVER log the actual OTP in production
+        }
+
+        // Store in Redis with strict 5-minute expiration
+        redisTemplate.opsForValue().set(OTP_PREFIX + username, otp, OTP_VALIDITY);
+
         return otp;
     }
 
     public void validateOtp(String username, String otp) {
-        String storedOtp = otpStorage.getOrDefault(username, "123456");
-        if (!storedOtp.equals(otp)) {
-            throw new IllegalArgumentException("  Invalid OTP!");
+        if (otp == null || otp.isBlank()) {
+            throw new IllegalArgumentException("OTP cannot be empty");
         }
-        otpStorage.remove(username);
-        log.info("  OTP Validated for [{}]", username);
+
+        String redisKey = OTP_PREFIX + username;
+        String storedOtp = redisTemplate.opsForValue().get(redisKey);
+
+        if (storedOtp == null) {
+            throw new IllegalArgumentException("OTP has expired or was never requested");
+        }
+
+        if (!storedOtp.equals(otp)) {
+            throw new IllegalArgumentException("Invalid OTP!");
+        }
+
+        // Successful validation must immediately invalidate the OTP to prevent replay attacks
+        redisTemplate.delete(redisKey);
+        log.info("OTP Successfully Validated for [{}]", username);
     }
 }
